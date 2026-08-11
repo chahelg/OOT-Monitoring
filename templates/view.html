@@ -66,10 +66,10 @@
                 <td>{{ r.APPLICATION_NAME }}</td>
                 <td>{{ r.BUSINESS_OBJECT_KEY }}</td>
                 <td>{{ r.SEQUENCE }}</td>
-                <td class="truncate">{{ r.TRANSACTION_URL }}</td>
-                <td class="truncate">{{ r.ALERT_MESSAGE }}</td>
-                <td class="truncate">{{ r.ERROR_MESSAGE }}</td>
-                <td class="truncate">{{ r.ERROR_DETAILS }}</td>
+                <td class="truncate" onclick="toggleCellExpand(this)" title="Click to expand">{{ r.TRANSACTION_URL }}</td>
+                <td class="truncate" onclick="toggleCellExpand(this)" title="Click to expand">{{ r.ALERT_MESSAGE }}</td>
+                <td class="truncate" onclick="toggleCellExpand(this)" title="Click to expand">{{ r.ERROR_MESSAGE }}</td>
+                <td class="truncate" onclick="toggleCellExpand(this)" title="Click to expand">{{ r.ERROR_DETAILS }}</td>
               </tr>
               {% endfor %}
             </tbody>
@@ -161,6 +161,10 @@
   </div>
 
   <script>
+    function toggleCellExpand(cell) {
+      cell.classList.toggle('cell-expanded');
+    }
+
     async function copyTable(tableId) {
       const table = document.getElementById(tableId);
       if (!table) return;

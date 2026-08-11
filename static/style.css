@@ -443,6 +443,23 @@ table td.truncate {
   max-width: 320px;
   overflow: hidden;
   text-overflow: ellipsis;
+  cursor: pointer;
+}
+
+table td.truncate:hover {
+  background: #eef2fa;
+}
+
+table td.truncate.cell-expanded {
+  max-width: 640px;
+  overflow: visible;
+  text-overflow: unset;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: #fff;
+  box-shadow: inset 0 0 0 1px var(--primary);
+  position: relative;
+  z-index: 1;
 }
 
 table td.nowrap {
