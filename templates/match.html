@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Match Rules — Alert Monitoring Workbook Generator</title>
+  <link rel="icon" type="image/png" href="{{ url_for('static', filename='favicon.png') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <div class="brand-bar"></div>
+  <div class="page page-wide">
+    {% include "_header.html" %}
+
+    <div class="card toolbar-card">
+      <form method="get" action="{{ url_for('match') }}" class="toolbar-form">
+        <label for="file">File</label>
+        <select id="file" name="file" onchange="this.form.submit()">
+          {% for t in templates %}
+            <option value="{{ t.name }}" {% if t.name == selected_file %}selected{% endif %}>{{ t.name }}</option>
+          {% endfor %}
+        </select>
+      </form>
+      <p class="muted-note">Editing <strong>{{ selected_file }}</strong> — this is the file the
+        classification formulas in the workbook read from. Changes here don't touch any generated
+        report; they take effect the next time you use this file as a template.</p>
+    </div>
+
+    {% if saved %}
+      <div class="card result result-ok"><h2><span class="status-icon">&check;</span> Saved</h2>
+        <p>Match rules updated.</p></div>
+    {% endif %}
+    {% if error %}
+      <div class="card result result-fail"><h2><span class="status-icon">&cross;</span> Couldn't save</h2>
+        <p>{{ error }}</p></div>
+    {% endif %}
+
+    {% if draft %}
+      <div class="card draft-card">
+        <p><strong>New error spotted:</strong></p>
+        <p class="draft-text">{{ draft }}</p>
+        <button type="button" class="btn" onclick="addRowFromDraft()">Add a rule for this</button>
+      </div>
+    {% endif %}
+
+    <form method="post" action="{{ url_for('match_save') }}" id="match-form">
+      <input type="hidden" name="file" value="{{ selected_file }}">
+      <input type="hidden" name="row_ids" id="row_ids" value="{% for i in range(rules|length) %}{{ i }}{% if not loop.last %},{% endif %}{% endfor %}">
+
+      <div class="card">
+        <div class="table-scroll">
+          <table id="match-table">
+            <thead>
+              <tr><th>String a</th><th>String b</th><th>Result</th><th>Check</th><th></th></tr>
+            </thead>
+            <tbody id="match-tbody">
+              {% for rule in rules %}
+              <tr data-row-id="{{ loop.index0 }}">
+                <td><input type="text" name="string_a_{{ loop.index0 }}" value="{{ rule.string_a }}"></td>
+                <td><input type="text" name="string_b_{{ loop.index0 }}" value="{{ rule.string_b }}"></td>
+                <td><input type="text" name="result_{{ loop.index0 }}" value="{{ rule.result }}"></td>
+                <td class="check-cell"><input type="checkbox" name="check_{{ loop.index0 }}" {% if rule.check == 1 %}checked{% endif %}></td>
+                <td><button type="button" class="btn-link" onclick="deleteRow(this, {{ loop.index0 }})">Delete</button></td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        <div class="table-toolbar">
+          <button type="button" class="btn" onclick="addRow()">+ Add row</button>
+        </div>
+      </div>
+
+      <button type="submit" class="btn btn-primary">Save changes</button>
+    </form>
+  </div>
+
+  <script>
+    var nextIndex = {{ rules|length }};
+
+    function currentRowIds() {
+      var field = document.getElementById('row_ids');
+      return field.value ? field.value.split(',').filter(Boolean) : [];
+    }
+
+    function setRowIds(ids) {
+      document.getElementById('row_ids').value = ids.join(',');
+    }
+
+    function makeRow(idx, stringA, stringB, result, checked) {
+      var tr = document.createElement('tr');
+      tr.dataset.rowId = idx;
+      tr.innerHTML =
+        '<td><input type="text" name="string_a_' + idx + '" value="' + (stringA || '').replace(/"/g, '&quot;') + '"></td>' +
+        '<td><input type="text" name="string_b_' + idx + '" value="' + (stringB || '').replace(/"/g, '&quot;') + '"></td>' +
+        '<td><input type="text" name="result_' + idx + '" value="' + (result || '').replace(/"/g, '&quot;') + '"></td>' +
+        '<td class="check-cell"><input type="checkbox" name="check_' + idx + '"' + (checked ? ' checked' : '') + '></td>' +
+        '<td><button type="button" class="btn-link" onclick="deleteRow(this, ' + idx + ')">Delete</button></td>';
+      return tr;
+    }
+
+    function addRow() {
+      var idx = nextIndex++;
+      var ids = currentRowIds();
+      ids.push(idx);
+      setRowIds(ids);
+      var row = makeRow(idx, '', '', '', false);
+      document.getElementById('match-tbody').appendChild(row);
+      row.querySelector('input').focus();
+      return row;
+    }
+
+    function addRowFromDraft() {
+      var row = addRow();
+      row.querySelectorAll('input[type=text]')[2].value = {{ draft|tojson }};
+    }
+
+    function deleteRow(button, idx) {
+      var ids = currentRowIds().filter(function (id) { return id != idx; });
+      setRowIds(ids);
+      button.closest('tr').remove();
+    }
+  </script>
+</body>
+</html>

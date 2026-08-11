@@ -1,0 +1,18 @@
+# Generated workbooks — real daily output, never checked in
+output/
+
+# The reference/template workbook used to seed a day's Match sheet —
+# contains real historical alert data, not code
+Copy of Copy of active-alert category 3 Aug.xlsx
+
+# Python
+__pycache__/
+*.pyc
+
+# Stray local test/log artifacts
+*.log
+*.tmp-*
+
+# OS cruft
+.DS_Store
+Thumbs.db

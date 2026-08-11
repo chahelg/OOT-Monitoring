@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Server stopped</title>
+  <link rel="icon" type="image/png" href="{{ url_for('static', filename='favicon.png') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <div class="brand-bar"></div>
+  <div class="page">
+    {% include "_header.html" %}
+    <div class="card">
+      <h2><span class="status-icon">&check;</span> Server stopped</h2>
+      <p>You can close this tab.</p>
+    </div>
+  </div>
+</body>
+</html>

@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>View Table — Alert Monitoring Workbook Generator</title>
+  <link rel="icon" type="image/png" href="{{ url_for('static', filename='favicon.png') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <div class="brand-bar"></div>
+  <div class="page page-wide">
+    {% include "_header.html" %}
+
+    <div class="card toolbar-card">
+      <form method="get" action="{{ url_for('view') }}" class="toolbar-form">
+        <label for="file">File</label>
+        <select id="file" name="file" onchange="this.form.submit()">
+          {% for t in templates %}
+            <option value="{{ t.name }}" {% if t.name == selected_file %}selected{% endif %}>{{ t.name }}</option>
+          {% endfor %}
+        </select>
+        <input type="hidden" name="tab" value="{{ tab }}">
+      </form>
+
+      <div class="tab-toggle">
+        <a href="{{ url_for('view', file=selected_file, tab='data') }}"
+           class="{{ 'active' if tab == 'data' else '' }}">Data ({{ rows|length }} rows)</a>
+        <a href="{{ url_for('view', file=selected_file, tab='excel_pivot') }}"
+           class="{{ 'active' if tab == 'excel_pivot' else '' }}">Pivot</a>
+        <a href="{{ url_for('view', file=selected_file, tab='aging') }}"
+           class="{{ 'active' if tab == 'aging' else '' }}">Aging{% if aging %} ({{ aging|selectattr('flagged')|list|length }} flagged){% endif %}</a>
+        <a href="{{ url_for('view', file=selected_file, tab='email_draft') }}"
+           class="{{ 'active' if tab == 'email_draft' else '' }}">Email Draft</a>
+      </div>
+    </div>
+
+    {% if error %}
+      <div class="card result result-fail">
+        <h2><span class="status-icon">&cross;</span> Can't show table</h2>
+        <p>{{ error }}</p>
+      </div>
+    {% elif tab == 'data' %}
+      <div class="card">
+        <div class="table-toolbar">
+          <button type="button" class="btn" onclick="copyTable('data-table')">Copy table</button>
+          <span id="copy-feedback" class="copy-feedback"></span>
+        </div>
+        <div class="table-scroll">
+          <table id="data-table">
+            <thead>
+              <tr>
+                <th>alert grouping</th><th>Timestamp Readable</th><th>Alert type</th><th>Check</th>
+                <th>TIMESTAMP</th><th>SERVICE</th><th>APPLICATION_NAME</th><th>BUSINESS_OBJECT_KEY</th>
+                <th>SEQUENCE</th><th>TRANSACTION_URL</th><th>ALERT_MESSAGE</th><th>ERROR_MESSAGE</th><th>ERROR_DETAILS</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for r in rows %}
+              <tr>
+                <td>{{ r.grouping }}</td>
+                <td class="nowrap">{{ r.timestamp_readable.strftime('%Y-%m-%d %H:%M:%S') }}</td>
+                <td>{{ r.alert_type }}</td>
+                <td>{{ r.check if r.check is not none else '' }}</td>
+                <td>{{ r.TIMESTAMP }}</td>
+                <td>{{ r.SERVICE }}</td>
+                <td>{{ r.APPLICATION_NAME }}</td>
+                <td>{{ r.BUSINESS_OBJECT_KEY }}</td>
+                <td>{{ r.SEQUENCE }}</td>
+                <td class="truncate">{{ r.TRANSACTION_URL }}</td>
+                <td class="truncate">{{ r.ALERT_MESSAGE }}</td>
+                <td class="truncate">{{ r.ERROR_MESSAGE }}</td>
+                <td class="truncate">{{ r.ERROR_DETAILS }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    {% elif tab == 'excel_pivot' %}
+      <div class="card">
+        <p class="muted-note">Opens the workbook in Excel, refreshes the real pivot table, and shows
+          exactly what Sheet2 contains — takes a few seconds and requires Excel to be installed on
+          this machine. Never touches your actual file; it works on a throwaway copy.</p>
+        {% if excel_pivot and excel_pivot.ok %}
+          <div class="table-toolbar">
+            <button type="button" class="btn btn-primary" id="excel-copy-btn"
+                    onclick="copyExcelPivot({{ selected_file|tojson }})">Copy (with Excel formatting)</button>
+            <span id="excel-copy-feedback" class="copy-feedback"></span>
+          </div>
+          <p class="muted-note">This button has Excel itself copy the range — colors, bold subtotal
+            rows, borders, and blank-vs-zero cells all come through exactly as shown below when you
+            paste (Ctrl+V) into Excel, Outlook, Word, or Teams.</p>
+          <div class="table-scroll">
+            <table id="excel-pivot-table">
+              {% for row in excel_pivot.rows %}
+                <tr>{% for cell in row %}<td>{{ cell }}</td>{% endfor %}</tr>
+              {% endfor %}
+            </table>
+          </div>
+        {% elif excel_pivot %}
+          <div class="result result-fail" style="margin:0;">
+            <h2><span class="status-icon">&cross;</span> Couldn't refresh</h2>
+            <p>{{ excel_pivot.error }}</p>
+          </div>
+        {% endif %}
+      </div>
+    {% elif tab == 'aging' %}
+      <div class="card">
+        <p class="muted-note">Alert types grouped across the whole file, flagged if the earliest
+          occurrence of that category is more than 48 hours old — i.e. it's still showing up in
+          today's export past the expected resolution window. Sorted worst (oldest) first, then by
+          count.</p>
+        <div class="table-toolbar">
+          <button type="button" class="btn" onclick="copyTable('aging-table')">Copy table</button>
+          <span id="copy-feedback" class="copy-feedback"></span>
+        </div>
+        <div class="table-scroll">
+          <table id="aging-table">
+            <thead>
+              <tr>
+                <th>Status</th><th>Alert type</th><th>alert grouping</th><th>Count</th>
+                <th>First seen</th><th>Age (days)</th><th>Pattern</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for r in aging %}
+              <tr class="{{ 'aging-flagged' if r.flagged else '' }}">
+                <td>{% if r.flagged %}<span class="status-badge status-badge-fail">STALE</span>
+                    {% elif r.is_new_spike %}<span class="status-badge status-badge-warn">NEW SPIKE</span>
+                    {% else %}<span class="status-badge status-badge-ok">OK</span>{% endif %}</td>
+                <td>{{ r.alert_type }}</td>
+                <td>{{ r.grouping }}</td>
+                <td>{{ r.count }}</td>
+                <td class="nowrap">{{ r.earliest.strftime('%Y-%m-%d') }}</td>
+                <td>{{ r.age_days }}</td>
+                <td>{{ 'Recurring' if r.is_recurring else ('New spike' if r.is_new_spike else '') }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    {% elif tab == 'email_draft' %}
+      <div class="card">
+        <p class="muted-note">Auto-generated draft — review and edit before sending. The
+          per-category facts (counts, dates, age) are computed directly from this file. The
+          "recurring vs. new spike" framing uses one fixed rule: <strong>recurring</strong> = alerts
+          landed on 2+ distinct days, including within the dataset's last 2 days; <strong>new
+          spike</strong> = a category under 48h old where ~80%+ of its volume is on the single most
+          recent day. Everything else is a plain statement of the count/date facts.</p>
+        <div class="table-toolbar">
+          <button type="button" class="btn btn-primary" onclick="copyDraftText()">Copy text</button>
+          <span id="draft-copy-feedback" class="copy-feedback"></span>
+        </div>
+        <textarea id="draft-text" class="draft-textarea" spellcheck="false">{{ email_draft }}</textarea>
+        <p class="muted-note">After pasting this text into your email, switch to the <strong>Pivot</strong>
+          tab and use its "Copy (with Excel formatting)" button to paste the table underneath it —
+          matching "...followed by the pivot table image."</p>
+      </div>
+    {% endif %}
+  </div>
+
+  <script>
+    async function copyTable(tableId) {
+      const table = document.getElementById(tableId);
+      if (!table) return;
+      const html = table.outerHTML;
+      const text = Array.from(table.rows).map(function (row) {
+        return Array.from(row.cells).map(function (cell) { return cell.innerText; }).join('\t');
+      }).join('\n');
+      const feedback = document.getElementById('copy-feedback');
+      try {
+        await navigator.clipboard.write([
+          new ClipboardItem({
+            'text/html': new Blob([html], { type: 'text/html' }),
+            'text/plain': new Blob([text], { type: 'text/plain' }),
+          }),
+        ]);
+      } catch (e) {
+        try {
+          await navigator.clipboard.writeText(text);
+        } catch (e2) {
+          if (feedback) feedback.textContent = 'Copy failed — select the table manually.';
+          return;
+        }
+      }
+      if (feedback) {
+        feedback.textContent = 'Copied!';
+        setTimeout(function () { feedback.textContent = ''; }, 2000);
+      }
+    }
+
+    async function copyExcelPivot(filename) {
+      const btn = document.getElementById('excel-copy-btn');
+      const feedback = document.getElementById('excel-copy-feedback');
+      const originalText = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = 'Copying… (opening Excel)';
+      feedback.textContent = '';
+      feedback.classList.remove('copy-feedback-error');
+      try {
+        const resp = await fetch('/view/copy-excel-pivot', {
+          method: 'POST',
+          body: new URLSearchParams({ file: filename }),
+        });
+        const data = await resp.json();
+        if (data.ok) {
+          feedback.textContent = 'Copied! Press Ctrl+V to paste, with full Excel formatting, anywhere.';
+        } else {
+          feedback.textContent = 'Copy failed: ' + (data.error || 'unknown error');
+          feedback.classList.add('copy-feedback-error');
+        }
+      } catch (e) {
+        feedback.textContent = 'Copy failed: ' + e;
+        feedback.classList.add('copy-feedback-error');
+      } finally {
+        btn.disabled = false;
+        btn.textContent = originalText;
+      }
+    }
+
+    async function copyDraftText() {
+      const textarea = document.getElementById('draft-text');
+      const feedback = document.getElementById('draft-copy-feedback');
+      try {
+        await navigator.clipboard.writeText(textarea.value);
+        feedback.textContent = 'Copied!';
+        setTimeout(function () { feedback.textContent = ''; }, 2000);
+      } catch (e) {
+        textarea.select();
+        feedback.textContent = 'Could not auto-copy — text is selected, press Ctrl+C.';
+      }
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Alert Monitoring Workbook Generator</title>
+  <link rel="icon" type="image/png" href="{{ url_for('static', filename='favicon.png') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <div class="brand-bar"></div>
+  <div class="page">
+    {% include "_header.html" %}
+
+    <form class="card" id="generate-form" method="post" action="{{ url_for('generate') }}" enctype="multipart/form-data">
+      <fieldset>
+        <legend>Inputs</legend>
+
+        <label for="technical">Technical export</label>
+        <input type="file" id="technical" name="technical" accept=".csv,.xlsx" required>
+
+        <label for="functional">Functional export</label>
+        <input type="file" id="functional" name="functional" accept=".csv,.xlsx" required>
+
+        <label for="template_choice">Template workbook (most recent day's output)</label>
+        <select id="template_choice" name="template_choice">
+          {% if not templates %}
+            <option value="">No previous output found — upload one below</option>
+          {% endif %}
+          {% for t in templates %}
+            <option value="{{ t.name }}">{{ t.name }}</option>
+          {% endfor %}
+        </select>
+
+        <label for="template_upload">…or upload a different template</label>
+        <input type="file" id="template_upload" name="template_upload" accept=".xlsx">
+
+        <label for="output_name">Save generated workbook as</label>
+        <input type="text" id="output_name" name="output_name" value="{{ default_output_name }}">
+
+        <label class="checkbox-row">
+          <input type="checkbox" name="validate" checked>
+          Validate in Excel after generating (forces recalc + pivot refresh, checks for formula errors)
+        </label>
+      </fieldset>
+
+      <button type="submit" id="generate-btn" class="btn btn-primary">Generate</button>
+    </form>
+
+    {% if result %}
+      {% if result.ok %}
+        <div class="card result result-ok">
+          <h2><span class="status-icon">&check;</span> Done — {{ result.output_name }}</h2>
+          <p>{{ result.row_count }} rows written
+            ({{ result.technical_count }} technical + {{ result.functional_count }} functional).</p>
+
+          <div class="actions">
+            <a class="btn" href="{{ url_for('view', file=result.output_name, tab='data') }}">View Data Table</a>
+            <a class="btn" href="{{ url_for('view', file=result.output_name, tab='excel_pivot') }}">View Pivot</a>
+            <a class="btn" href="{{ url_for('download', filename=result.output_name) }}">Download</a>
+            <button type="button" class="btn" onclick="openPath('{{ result.output_path|e }}', '/open-file')">Open in Excel</button>
+            <button type="button" class="btn" onclick="openPath('{{ result.output_path|e }}', '/open-folder')">Open Folder</button>
+          </div>
+
+          {% if result.unmatched %}
+            <div class="log-line action">
+              [ACTION NEEDED] {{ result.unmatched|length }} distinct error message(s) don't match any
+              Match sheet rule yet (Alert type will be blank, Check will show #N/A).
+              Add a String a / String b / Result row to Match for each:
+            </div>
+            <ul class="unmatched-list">
+              {% for text, count in result.unmatched %}
+                <li>
+                  <span class="count-badge">{{ count }}x</span> {{ text[:200] }}{% if text|length > 200 %}…{% endif %}
+                  <a class="btn-link" href="{{ url_for('match', file=result.output_name, draft=text) }}">Add rule for this</a>
+                </li>
+              {% endfor %}
+            </ul>
+          {% endif %}
+
+          {% if result.log %}
+            <div class="log-box">
+              {% for line in result.log %}
+                {% if line.startswith('[OK]') %}
+                  <div class="log-line ok">{{ line }}</div>
+                {% elif line.startswith('[WARN]') %}
+                  <div class="log-line warn">{{ line }}</div>
+                {% elif line.startswith('[FAIL]') %}
+                  <div class="log-line fail">{{ line }}</div>
+                {% else %}
+                  <div class="log-line">{{ line }}</div>
+                {% endif %}
+              {% endfor %}
+            </div>
+          {% endif %}
+        </div>
+      {% else %}
+        <div class="card result result-fail">
+          <h2><span class="status-icon">&cross;</span> Generation failed</h2>
+          <p>{{ result.error }}</p>
+        </div>
+      {% endif %}
+    {% endif %}
+
+    <footer>
+      <form method="post" action="{{ url_for('shutdown') }}" onsubmit="return confirm('Stop the local server?');">
+        <button type="submit" class="btn-link">Shut down server</button>
+      </form>
+    </footer>
+  </div>
+
+  <script>
+    document.getElementById('generate-form').addEventListener('submit', function () {
+      var btn = document.getElementById('generate-btn');
+      btn.disabled = true;
+      btn.textContent = 'Generating…';
+    });
+
+    function openPath(path, endpoint) {
+      var body = new URLSearchParams({ path: path });
+      fetch(endpoint, { method: 'POST', body: body })
+        .catch(function () { /* best-effort; nothing to show on failure here */ });
+    }
+  </script>
+</body>
+</html>

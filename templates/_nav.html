@@ -1,0 +1,5 @@
+<nav class="app-nav">
+  <a href="{{ url_for('index') }}" class="{{ 'active' if request.endpoint == 'index' else '' }}">Generate</a>
+  <a href="{{ url_for('view') }}" class="{{ 'active' if request.endpoint == 'view' else '' }}">View Table</a>
+  <a href="{{ url_for('match') }}" class="{{ 'active' if request.endpoint == 'match' else '' }}">Match Rules</a>
+</nav>
