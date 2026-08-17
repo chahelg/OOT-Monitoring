@@ -16,12 +16,18 @@ Usage:
 """
 
 import argparse
+import concurrent.futures
 import csv
+import json
 import os
 import re
 import shutil
+import subprocess
+import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
 import zipfile
 from collections import defaultdict
 from datetime import date, datetime, timedelta
@@ -437,7 +443,25 @@ def compute_aging(rows: list[dict], now: datetime | None = None, threshold_hours
     return flagged_results + other_results
 
 
-def build_email_draft(rows: list[dict], aging: list[dict], threshold_hours: int = 48) -> str:
+def compute_aging_stats(aging: list[dict], top_n: int = 10) -> dict:
+    """Summary numbers + a magnitude-ranked top-N slice for the Aging tab
+    dashboard (stat tiles + bar chart) — kept separate from `compute_aging`
+    itself since the table (worst-age-first) and the chart (ranked by
+    count) have different jobs and sort orders."""
+    flagged = [r for r in aging if r["flagged"]]
+    spikes = [r for r in aging if r["is_new_spike"]]
+    top = sorted(aging, key=lambda r: -r["count"])[:top_n]
+    return {
+        "n_flagged": len(flagged),
+        "n_spikes": len(spikes),
+        "flagged_total": sum(r["count"] for r in flagged),
+        "oldest_days": max((r["age_days"] for r in flagged), default=0),
+        "max_count": max((r["count"] for r in aging), default=1),
+        "top": top,
+    }
+
+
+def build_email_draft(rows: list[dict], aging: list[dict], threshold_hours: int = 48, max_items: int = 6) -> str:
     """Plain-text daily observations email draft in the style of the
     team's existing daily email: a numbered paragraph per aging category
     (count, day-by-day breakdown, age — all facts) plus one disclosed,
@@ -445,10 +469,19 @@ def build_email_draft(rows: list[dict], aging: list[dict], threshold_hours: int 
     compute_aging's docstring for the exact rule). This is a draft to
     review before sending, not a final email — this tool has no
     send capability at all, only text generation.
+
+    On a file where the rolling-window data means most/all categories
+    are past the 48h threshold, `flagged` can be large (seen: all 18 of
+    18) — writing an individual paragraph for every one of them isn't a
+    usable email. Only the highest-volume `max_items` get a full
+    write-up; the rest are named in one rollup line instead of silently
+    dropped.
     """
     lines = ["Good morning Team,", "Sharing the daily alert summary.", "", "Observations:"]
 
-    flagged = [r for r in aging if r["flagged"]]
+    flagged_all = sorted((r for r in aging if r["flagged"]), key=lambda r: -r["count"])
+    flagged = flagged_all[:max_items]
+    overflow = flagged_all[max_items:]
     spikes = [r for r in aging if r["is_new_spike"]]
 
     n = 0
@@ -490,6 +523,16 @@ def build_email_draft(rows: list[dict], aging: list[dict], threshold_hours: int 
         )
         lines.append("")
 
+    if overflow:
+        n += 1
+        names = ", ".join(f'"{r["alert_type"]}"' for r in overflow[:5])
+        more = f", and {len(overflow) - 5} more" if len(overflow) > 5 else ""
+        lines.append(
+            f'{n}.\t{len(overflow)} more categories are also past the 48-hour window but at lower '
+            f'volume: {names}{more}.'
+        )
+        lines.append("")
+
     technical_total = sum(1 for r in rows if r["grouping"] == "Technical")
     functional_total = sum(1 for r in rows if r["grouping"] == "Functional")
     latest_date = max((r["timestamp_readable"].date() for r in rows), default=None)
@@ -497,15 +540,21 @@ def build_email_draft(rows: list[dict], aging: list[dict], threshold_hours: int 
 
     if flagged or spikes:
         n += 1
+        if technical_total == functional_total:
+            split_clause = f'technical and functional issues are evenly split ({technical_total} each)'
+        else:
+            bigger_label, bigger, smaller_label, smaller = (
+                ("Technical", technical_total, "functional", functional_total)
+                if technical_total > functional_total
+                else ("Functional", functional_total, "technical", technical_total)
+            )
+            split_clause = f'{bigger_label} issues continue to dominate over {smaller_label} issues ({bigger} vs {smaller})'
         tail = (
-            f', with {latest_date.strftime("%d-%m-%Y")} also showing a concentration of '
-            f'{latest_date_total} alerts that day.'
+            f', with {latest_date.strftime("%d-%m-%Y")} accounting for '
+            f'{latest_date_total} alert{"s" if latest_date_total != 1 else ""} that day.'
             if latest_date else '.'
         )
-        lines.append(
-            f'{n}.\tOverall, technical issues ({technical_total}) continue to dominate over '
-            f'functional issues ({functional_total})' + tail
-        )
+        lines.append(f'{n}.\tOverall, {split_clause}' + tail)
         lines.append("")
 
     if flagged:
@@ -516,6 +565,267 @@ def build_email_draft(rows: list[dict], aging: list[dict], threshold_hours: int 
             f'particularly around {top_names}, suggesting the expected {threshold_hours}-hour '
             f'turnaround time is not being consistently met.'
         )
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+# Local-only by design: this calls Ollama on 127.0.0.1, never an external
+# API — the alert data (error text, business object keys, service names,
+# internal URLs) never leaves this machine. See build_email_draft_ai.
+OLLAMA_URL = "http://localhost:11434"
+OLLAMA_EMAIL_MODEL = "qwen2.5:7b"
+
+
+def _ordinal_day(n: int) -> str:
+    suffix = "th" if 11 <= n % 100 <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
+
+def _select_notable_categories(aging: list[dict], max_items: int = 6) -> list[dict]:
+    """Which categories earn an individual write-up in the AI draft.
+    Deliberately broader than build_email_draft()'s fixed flagged/spike
+    rule — a real analyst also calls out things like a high-volume
+    category or a sharp decline, neither of which is "flagged" or a
+    "new spike" by that rule's definition (see the real example email
+    this feature was modeled on: its 4th item was neither, just a
+    volume drop worth a mention). Selection itself stays deterministic
+    Python, not the LLM's call — only the analytical wording below is
+    model-written, which is what keeps this reliable on a small local
+    model (see build_email_draft_ai's docstring)."""
+    max_count = max((r["count"] for r in aging), default=1)
+    scored = []
+    for r in aging:
+        reasons = []
+        if r["flagged"]:
+            reasons.append(f"open {r['age_days']}d, past the 48h SLA")
+        if r["is_new_spike"]:
+            reasons.append("almost all volume landed on the single latest day")
+        if r["is_recurring"]:
+            reasons.append("alerts keep appearing across multiple days including recently")
+        if r["count"] >= max(8, max_count * 0.15):
+            reasons.append("notably high volume")
+        if len(r["day_counts"]) >= 2:
+            peak = max(c for _, c in r["day_counts"])
+            latest = r["day_counts"][-1][1]
+            if peak >= 10 and latest <= peak * 0.5:
+                reasons.append(f"down sharply from a peak of {peak} to {latest} most recently")
+        if reasons:
+            scored.append((r, reasons))
+    scored.sort(key=lambda item: -item[0]["count"])
+    if not scored:
+        scored = [(r, ["among today's highest-volume categories"]) for r in sorted(aging, key=lambda r: -r["count"])[:3]]
+    return scored[:max_items]
+
+
+def _describe_trend(day_counts: list[tuple]) -> str:
+    """Labels a category's day-by-day shape as an unambiguous fact
+    handed to the model, rather than something it has to work out from
+    the raw numbers itself. Directly motivated by a demonstrated failure
+    mode: even told to "ground it strictly in the numbers", the model
+    would occasionally call a 2-to-1 drop "a rise" or invent a decline
+    that wasn't in the data. Pre-computing the direction in Python and
+    telling it not to contradict the label removes that failure mode the
+    same way pre-computing every other fact already does."""
+    counts = [c for _, c in day_counts]
+    if len(counts) == 1:
+        return f"SINGLE DAY ONLY — {counts[0]} alerts on one day, no other day to compare to. Do not claim any trend or comparison."
+    first, last, peak = counts[0], counts[-1], max(counts)
+    if last >= peak:
+        return f"RISING — from {first} up to {last} (its highest point) across {len(counts)} days."
+    if last <= min(counts) and last < first:
+        return f"DECLINING — from {first} down to {last} across {len(counts)} days."
+    if last < peak * 0.6:
+        return f"PEAKED THEN DECLINED — peaked at {peak}, now at {last}, across {len(counts)} days."
+    if last > first:
+        return f"RISING OVERALL — from {first} to {last} across {len(counts)} days (not monotonic)."
+    if last < first:
+        return f"DECLINING OVERALL — from {first} down to {last} across {len(counts)} days (not monotonic)."
+    return f"FLAT — steady around {last} across {len(counts)} days."
+
+
+def _call_ollama(prompt: str, model: str, ollama_url: str, timeout: int) -> str:
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+        "options": {"temperature": 0.4},
+    }
+    req = urllib.request.Request(
+        f"{ollama_url.rstrip('/')}/api/chat",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.loads(e.read().decode("utf-8")).get("error", str(e))
+        except Exception:
+            msg = str(e)
+        raise RuntimeError(f"Ollama error: {msg} — is model {model!r} pulled? Run `ollama pull {model}`.") from e
+    except (urllib.error.URLError, TimeoutError) as e:
+        raise RuntimeError(
+            f"Couldn't reach Ollama at {ollama_url} (or it timed out) — is it running? "
+            f"Start it with `ollama serve`, or open the Ollama app, then try again. ({e})"
+        ) from e
+
+    text = body.get("message", {}).get("content", "").strip()
+    if not text:
+        raise RuntimeError("Ollama returned an empty response — try again.")
+    return text
+
+
+def _strip_wrapping_quotes(text: str) -> str:
+    """Strips a quote pair only if it truly wraps the whole string (both
+    ends). Models sometimes quote just a category name mid-sentence
+    ("X" is the priority because...) rather than the whole reply —
+    str.strip('"') would wrongly eat that lone leading quote and leave
+    the unmatched closing one dangling, so this checks both ends."""
+    text = text.strip()
+    if len(text) >= 2 and text[0] == '"' and text[-1] == '"':
+        return text[1:-1].strip()
+    return text
+
+
+_LITERAL_DATE_RE = re.compile(r'\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b')
+
+
+def _strip_literal_dates(text: str) -> str:
+    """Defense-in-depth on top of the prompt's "never write a literal
+    date" instruction: the model doesn't always follow that, and has
+    gotten a date wrong when it didn't (attributing one category's count
+    to the wrong day). Rather than trust instruction-following alone,
+    this removes any DD-MM-YYYY-shaped token — with a leading
+    preposition if present — so a wrong date can never reach the final
+    email regardless of what the model did."""
+    text = re.sub(r'\s*\b(?:on|from|since|as of|starting)\s+' + _LITERAL_DATE_RE.pattern, '', text, flags=re.IGNORECASE)
+    text = _LITERAL_DATE_RE.sub('', text)
+    text = re.sub(r'\s{2,}', ' ', text)
+    text = re.sub(r'\s+([.,;:])', r'\1', text)
+    return text.strip()
+
+
+def build_email_draft_ai(
+    rows: list[dict],
+    aging: list[dict],
+    model: str = OLLAMA_EMAIL_MODEL,
+    ollama_url: str = OLLAMA_URL,
+    timeout: int = 600,
+) -> str:
+    """AI-assisted version of the daily observations email. Every fact —
+    which categories are mentioned, their counts, their day-by-day
+    breakdown, the totals — is computed in plain Python, exactly like
+    build_email_draft(); a local Ollama model (nothing ever leaves this
+    machine) is only asked to fill in the analytical commentary for each
+    one (spiking / recurring / newly-appeared / declining, in its own
+    words) plus the closing summary's framing sentence.
+
+    This split is deliberate, not just simpler: an early version handed
+    the whole email — facts included — to the model in one shot, seeded
+    with a real past email as a style example, and it partly reproduced
+    that example's own numbers and category names instead of using
+    today's data. A later version still batched all categories into one
+    prompt and the model occasionally borrowed one category's count for
+    another's sentence. A 7B model run locally just isn't reliable
+    enough at that scale of open-ended, multi-fact generation to trust
+    with the numbers. What's below instead makes one small, isolated
+    call per category — each only ever sees that one category's own
+    figures, so it has nothing else to confuse them with — and stitches
+    the results into a Python-built skeleton that owns every number.
+    That still leaves room for the model to misjudge *emphasis* (which
+    is fine — that's the point), which is why this is still a draft to
+    review before sending, same as build_email_draft().
+    """
+    if not aging:
+        raise ValueError("No data to draft an email from — generate or select a file with rows first.")
+
+    today = date.today()
+    all_dates = [d for r in aging for d, _ in r["day_counts"]]
+    if not all_dates:
+        raise ValueError("No dated alert rows to draft an email from.")
+    span_days = (max(all_dates) - min(all_dates)).days + 1
+    total_alerts = sum(r["count"] for r in aging)
+    latest_date = max(all_dates)
+    latest_date_total = sum(c for r in aging for d, c in r["day_counts"] if d == latest_date)
+
+    selected = _select_notable_categories(aging)
+    top_category = selected[0][0]["alert_type"]
+    # Only worth mentioning to the model at all if it's a real share of
+    # the day's volume — otherwise a 7B model tends to dutifully mention
+    # it anyway and call one stray alert a "meaningful concentration".
+    # Deciding this in Python (rather than asking the model to judge it)
+    # is the same principle as the rest of this function: never hand the
+    # model a judgment call Python can just make correctly beforehand.
+    latest_day_meaningful = latest_date_total >= max(5, total_alerts * 0.12)
+
+    # One isolated call per category — NOT one big call covering all of
+    # them. An earlier version batched all items into a single prompt
+    # and the model would occasionally borrow one category's number for
+    # another's sentence (e.g. claiming an 11-alert category "peaked at
+    # 105", which was actually a different category's figure). Giving
+    # each call only the one category's own numbers makes that
+    # particular failure structurally impossible, not just less likely
+    # — there's nothing else in its context to confuse it with. Costs
+    # more calls, but each is small and the model stays loaded between
+    # them, so it isn't much slower in practice.
+    per_item_analysis = []
+    for r, reasons in selected:
+        day_str = "; ".join(f"{d.strftime('%d-%m-%Y')}: {c} alert(s)" for d, c in r["day_counts"])
+        trend = _describe_trend(r["day_counts"])
+        item_prompt = f"""You are a data analyst writing ONE short note for an internal ops status email. Plain, direct, analytical tone — never marketing language, never an apology, never claiming something is fixed/closed/resolved unless the numbers say so.
+
+This alert category: "{r["alert_type"]}"
+Total: {r["count"]}
+Day-by-day (for context only): {day_str}
+Confirmed trend direction — treat this as ground truth, do not contradict it or re-derive your own direction from the day-by-day numbers: {trend}
+Why it stood out: {"; ".join(reasons)}
+
+Write 1-2 sentences of analysis consistent with the confirmed trend direction above (e.g. if it says DECLINING, your sentence must describe a decline, never a "spike" or "rise"; if SINGLE DAY ONLY, do not claim any trend or comparison to other days at all). Do not restate the category name or the total count — those are already shown elsewhere. Never write out a specific date yourself (they're already shown as bullets above you) — refer to timing only in relative terms if needed ("the most recent day", "earlier in the week"). Do not restate individual day counts from the day-by-day breakdown — describe the overall shape, not each value. Start straight into the analysis. Do not mention or compare to any other category, you have no information about any other category. Reply with ONLY the 1-2 sentences, nothing else — no preamble, no quotes, no label."""
+        analysis = _strip_literal_dates(_strip_wrapping_quotes(_call_ollama(item_prompt, model, ollama_url, timeout)))
+        per_item_analysis.append(analysis)
+
+    totals_list = "\n".join(f'- "{r["alert_type"]}": {r["count"]} total' for r, _ in selected)
+    summary_prompt = f"""You are a data analyst writing ONE closing sentence for an internal ops status email.
+
+Today's notable alert categories and their totals:
+{totals_list}
+
+"{top_category}" is today's top priority. Write ONE sentence (not a paragraph) explaining briefly why, grounded strictly in the totals above (e.g. its volume relative to the others, or that it's the largest). Do not restate the total alert count or repeat the list. Reply with ONLY that one sentence, nothing else — no preamble, no quotes, no label."""
+    priority_reason = _strip_wrapping_quotes(_call_ollama(summary_prompt, model, ollama_url, timeout))
+
+    lines = ["Good morning Team,", "Sharing the daily alert summary.", "",
+              f"PFA: the data sheet for today- {_ordinal_day(today.day)} {today.strftime('%b')}", "",
+              "Observations:"]
+    for i, ((r, _reasons), analysis) in enumerate(zip(selected, per_item_analysis)):
+        count = r["count"]
+        there_are = "There is" if count == 1 else "There are"
+        issue_word = "issue" if count == 1 else "issues"
+        lines.append(f'{i + 1}.\t{there_are} {count} {issue_word} in the "{r["alert_type"]}" category. '
+                      f'These issues occurred on the following dates:')
+        for d, c in r["day_counts"]:
+            lines.append(f'•\t{d.strftime("%d-%m-%Y")} – {c} alert{"s" if c != 1 else ""}')
+        if analysis:
+            lines.append(analysis)
+        lines.append("")
+
+    summary_line = f"Summary: Total alert volume is {total_alerts}."
+    if latest_day_meaningful:
+        summary_line += (
+            f" {latest_date.strftime('%d-%m-%Y')} was the highest-volume day with "
+            f"{latest_date_total} alert{'s' if latest_date_total != 1 else ''}."
+        )
+    if priority_reason:
+        summary_line += f" {priority_reason}"
+    lines.append(summary_line)
+    lines.append("")
+    lines.append(
+        f"Note: Since the log data only retains a {span_days}-day rolling window, open issues from "
+        f"before {min(all_dates).strftime('%d-%m-%Y')} are no longer visible in this data and may still "
+        "be unresolved in the source system. Recommend the team separately verify the status of older "
+        "open issues, as they can't be confirmed as closed just because they've dropped out of this report."
+    )
 
     return "\n".join(lines).rstrip() + "\n"
 
@@ -671,26 +981,29 @@ def patch_workbook_xml(xml_text: str) -> str:
     return xml_text
 
 
-def patch_workbook_rels(xml_text: str) -> str:
+def patch_workbook_rels(xml_text: str, detail_rid: str, calc_rid: str | None) -> str:
+    # detail_rid/calc_rid are resolved per-template (see generate_workbook)
+    # rather than assumed to always be "rId1"/"rId10" — which sheet/part
+    # physically lands at a given rId isn't stable across templates.
     xml_text = re.sub(
-        r'<Relationship Id="rId1" Type="[^"]*worksheet" Target="worksheets/sheet1\.xml"/>',
+        rf'<Relationship Id="{detail_rid}" Type="[^"]*worksheet" Target="[^"]*"/>',
         "",
         xml_text,
     )
-    xml_text = re.sub(
-        r'<Relationship Id="rId10" Type="[^"]*calcChain" Target="calcChain\.xml"/>',
-        "",
-        xml_text,
-    )
+    if calc_rid:
+        xml_text = re.sub(
+            rf'<Relationship Id="{calc_rid}" Type="[^"]*calcChain" Target="calcChain\.xml"/>',
+            "",
+            xml_text,
+        )
     return xml_text
 
 
-def patch_content_types(xml_text: str) -> str:
-    for part in (
-        "/xl/worksheets/sheet1.xml",
-        "/xl/tables/table1.xml",
-        "/xl/calcChain.xml",
-    ):
+def patch_content_types(xml_text: str, detail_sheet_part: str, detail_table_part: str | None) -> str:
+    parts = ["/" + detail_sheet_part, "/xl/calcChain.xml"]
+    if detail_table_part:
+        parts.append("/" + detail_table_part)
+    for part in parts:
         xml_text = re.sub(
             rf'<Override PartName="{re.escape(part)}"[^/]*/>', "", xml_text
         )
@@ -717,31 +1030,45 @@ def patch_pivot_cache_definition(xml_text: str) -> str:
     )
 
 
-def _resolve_sheet_part(workbook_xml: str, rels_xml: str, sheet_name: str) -> str:
-    """Finds which xl/worksheets/sheetN.xml a sheet name actually maps to
-    (sheet order/IDs aren't guaranteed stable across templates)."""
+def _sheet_rid(workbook_xml: str, sheet_name: str) -> str:
+    """Finds a sheet's r:id by name (sheet order/IDs aren't guaranteed
+    stable across templates — Excel names worksheet parts by creation
+    history, not by tab position, so "sheet1.xml"/"rId1" can end up
+    belonging to any tab depending on a template's own history)."""
     m = re.search(rf'<sheet[^>]*\bname="{re.escape(sheet_name)}"[^>]*/>', workbook_xml)
     if not m:
         raise ValueError(f"Sheet {sheet_name!r} not found in workbook.xml")
     rid_m = re.search(r'r:id="(rId\d+)"', m.group(0))
     if not rid_m:
         raise ValueError(f"No r:id found for sheet {sheet_name!r}")
-    rid = rid_m.group(1)
+    return rid_m.group(1)
+
+
+def _rid_target(rels_xml: str, rid: str) -> str:
     target_m = re.search(rf'<Relationship Id="{rid}"[^>]*Target="([^"]+)"', rels_xml)
     if not target_m:
         raise ValueError(f"Relationship {rid} not found in workbook.xml.rels")
     return "xl/" + target_m.group(1).lstrip("/")
 
 
-def _resolve_table_part(zin: zipfile.ZipFile, sheet_part: str) -> str | None:
-    """Finds the table part (e.g. xl/tables/table2.xml) attached to a
-    worksheet, if any, by following its own _rels file."""
+def _resolve_sheet_part(workbook_xml: str, rels_xml: str, sheet_name: str) -> str:
+    """Finds which xl/worksheets/sheetN.xml a sheet name actually maps to
+    (sheet order/IDs aren't guaranteed stable across templates)."""
+    return _rid_target(rels_xml, _sheet_rid(workbook_xml, sheet_name))
+
+
+def _resolve_related_part(zin: zipfile.ZipFile, sheet_part: str, type_suffix: str) -> str | None:
+    """Finds a part attached to a worksheet via its own _rels file (e.g.
+    its table, or a stashed customProperty bin), if any. Numeric suffixes
+    on these parts (table1.xml vs table2.xml, customProperty1.bin vs
+    customProperty2.bin) aren't stable across templates, so this always
+    follows the relationship rather than assuming a number."""
     sheet_dir, sheet_file = sheet_part.rsplit("/", 1)
     rels_path = f"{sheet_dir}/_rels/{sheet_file}.rels"
     if rels_path not in zin.namelist():
         return None
     rels_xml = zin.read(rels_path).decode("utf-8")
-    m = re.search(r'Type="[^"]*?/table"\s+Target="([^"]+)"', rels_xml)
+    m = re.search(rf'Type="[^"]*?/{type_suffix}"\s+Target="([^"]+)"', rels_xml)
     if not m:
         return None
     parts = []
@@ -751,6 +1078,12 @@ def _resolve_table_part(zin: zipfile.ZipFile, sheet_part: str) -> str | None:
         else:
             parts.append(part)
     return "/".join(parts)
+
+
+def _resolve_table_part(zin: zipfile.ZipFile, sheet_part: str) -> str | None:
+    """Finds the table part (e.g. xl/tables/table2.xml) attached to a
+    worksheet, if any, by following its own _rels file."""
+    return _resolve_related_part(zin, sheet_part, "table")
 
 
 def _match_rule_cell(col: str, row_num: int, text) -> str:
@@ -945,26 +1278,52 @@ def generate_workbook(technical_path: Path, functional_path: Path, template_path
     try:
         with zipfile.ZipFile(template_path, "r") as zin:
             names = zin.namelist()
-            skip = {
-                "xl/worksheets/sheet1.xml",
-                "xl/worksheets/_rels/sheet1.xml.rels",
-                "xl/tables/table1.xml",
-                "xl/customProperty1.bin",
-                "xl/calcChain.xml",
-            }
+            workbook_xml = zin.read("xl/workbook.xml").decode("utf-8")
+            rels_xml = zin.read("xl/_rels/workbook.xml.rels").decode("utf-8")
+
+            # Which physical sheetN.xml each logical tab maps to is NOT
+            # stable across templates — Excel names worksheet parts by
+            # creation history, not by current tab position, so a
+            # template that's been through more Excel saves can easily
+            # have "Data" living at sheet2.xml instead of sheet3.xml, or
+            # "Detail1" (the disposable staging sheet dropped below) at
+            # sheet2.xml instead of sheet1.xml. Resolving both by name
+            # (the same way Match-sheet edits already do) instead of by
+            # a hardcoded number is what keeps this from silently
+            # writing fresh data into the wrong tab, or deleting the
+            # wrong sheet's relationship, on a template with different
+            # internal numbering.
+            data_part = _resolve_sheet_part(workbook_xml, rels_xml, "Data")
+            detail_rid = _sheet_rid(workbook_xml, "Detail1")
+            detail_sheet_part = _rid_target(rels_xml, detail_rid)
+            detail_dir, detail_file = detail_sheet_part.rsplit("/", 1)
+            detail_sheet_rels_part = f"{detail_dir}/_rels/{detail_file}.rels"
+            detail_table_part = _resolve_table_part(zin, detail_sheet_part)
+            detail_custom_property_part = _resolve_related_part(zin, detail_sheet_part, "customProperty")
+            calc_rid_m = re.search(r'<Relationship Id="(rId\d+)"[^>]*Target="calcChain\.xml"', rels_xml)
+            calc_rid = calc_rid_m.group(1) if calc_rid_m else None
+
+            skip = {detail_sheet_part, detail_sheet_rels_part, "xl/calcChain.xml"}
+            if detail_table_part:
+                skip.add(detail_table_part)
+            if detail_custom_property_part:
+                skip.add(detail_custom_property_part)
+
             with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zout:
                 for name in names:
                     if name in skip:
                         continue
                     data = zin.read(name)
-                    if name == "xl/worksheets/sheet3.xml":
+                    if name == data_part:
                         data = data_sheet_xml.encode("utf-8")
                     elif name == "xl/workbook.xml":
                         data = patch_workbook_xml(data.decode("utf-8")).encode("utf-8")
                     elif name == "xl/_rels/workbook.xml.rels":
-                        data = patch_workbook_rels(data.decode("utf-8")).encode("utf-8")
+                        data = patch_workbook_rels(data.decode("utf-8"), detail_rid, calc_rid).encode("utf-8")
                     elif name == "[Content_Types].xml":
-                        data = patch_content_types(data.decode("utf-8")).encode("utf-8")
+                        data = patch_content_types(
+                            data.decode("utf-8"), detail_sheet_part, detail_table_part
+                        ).encode("utf-8")
                     elif name == "docProps/app.xml":
                         data = patch_app_xml(data.decode("utf-8")).encode("utf-8")
                     elif name == "xl/pivotCache/pivotCacheDefinition1.xml":
@@ -1009,47 +1368,178 @@ def find_latest_template() -> Path | None:
     return candidates[0] if candidates else None
 
 
-def validate_in_excel(path: Path, log) -> None:
-    """Opens a *throwaway copy* of the generated file in real Excel,
-    forces a full recalc and a pivot refresh, and reports any formula
-    errors via `log(message)`. Degrades gracefully (skips with a note) if
-    Excel/pywin32 isn't available.
+_TRANSIENT_COM_HRESULTS = {-2147418111, -2147417846}  # RPC_E_CALL_REJECTED, RPC_E_SERVERCALL_RETRYLATER
 
-    Deliberately never opens `path` itself: this workspace lives inside
-    a OneDrive-synced folder, and Excel silently enables AutoSave for
-    files stored there — opening the real deliverable via COM measurably
-    rewrites it on close *even with SaveChanges=False* (observed:
-    91,083 -> 90,755 bytes, with parts dropped from the archive). The
-    copy lives under the local temp dir, which OneDrive doesn't sync, so
-    the file the caller actually gets is never touched by Excel here.
+
+def _process_alive(pid: int) -> bool:
+    result = subprocess.run(
+        ["tasklist", "/FI", f"PID eq {pid}"],
+        capture_output=True, text=True,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    return str(pid) in result.stdout
+
+
+def _force_kill(pid: int) -> None:
+    subprocess.run(
+        ["taskkill", "/PID", str(pid), "/F"],
+        capture_output=True,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+
+
+def _run_in_excel(xlsx_path: Path, action, refresh_pivot: bool = True, attempts: int = 6, retry_delay: float = 1.5):
+    """Entry point for every "open a throwaway copy of a workbook in real
+    Excel and do something with Sheet2" operation. Runs the actual work
+    (`_run_in_excel_impl`) in a brand-new, dedicated thread every single
+    call — root-caused this as necessary, not optional: the web app's
+    Flask server runs single-threaded, so every request after the first
+    reuses the same OS thread's COM apartment, and repeated
+    CoInitialize/CoUninitialize cycles on that one thread degrade it —
+    confirmed directly: the *first* Excel COM call in a process/thread
+    always succeeded in testing, and *every* subsequent one on that same
+    thread then failed with RPC_E_CALL_REJECTED regardless of how long a
+    delay was inserted before retrying (ruling out a simple timing/
+    contention issue). A fresh thread has never touched COM before, so
+    it reliably reproduces the "always works" first-call state on every
+    invocation, independent of whatever thread the caller runs on.
+    """
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(_run_in_excel_impl, xlsx_path, action, refresh_pivot, attempts, retry_delay)
+        return future.result()
+
+
+def _run_in_excel_impl(xlsx_path: Path, action, refresh_pivot: bool, attempts: int, retry_delay: float):
+    """The actual implementation behind `_run_in_excel` — always called
+    from a fresh, dedicated thread (see that function's docstring for
+    why). Copies the file to a local temp dir — never the real file
+    itself, since this workspace lives inside a OneDrive-synced folder,
+    and Excel silently enables AutoSave for files stored there — opening
+    the real deliverable via COM measurably rewrites it on close *even
+    with SaveChanges=False* (observed: 91,083 -> 90,755 bytes, with
+    parts dropped from the archive). The temp copy lives outside any
+    synced folder, so the file the caller actually gets is never
+    touched here.
+
+    Opens the copy, forces a recalc, optionally refreshes the pivot
+    table, then hands control to `action(excel, wb, sheet2)` to do the
+    function-specific work and return its result. Closes the workbook
+    and quits Excel afterward either way.
+
+    Retries the *whole* attempt (a fresh Excel process each time) up to
+    `attempts` times on the specific transient COM errors
+    RPC_E_CALL_REJECTED / RPC_E_SERVERCALL_RETRYLATER ("Call was rejected
+    by callee") — Excel intermittently rejects automation calls made
+    right after Dispatch/Open, before it's fully settled. Any other
+    error is raised immediately, no retry.
+
+    Uses plain (late-bound) `win32com.client.Dispatch` rather than
+    `gencache.EnsureDispatch` deliberately: the latter depends on a
+    generated-wrapper cache under the user's temp folder that can go
+    stale/corrupt (hit this directly during testing — it broke with
+    "module ... has no attribute 'MinorVersion'" until the cache was
+    cleared) and buys nothing here, since nothing in this module uses
+    named Excel constants.
+    """
+    import pythoncom
+    import pywintypes
+    import win32com.client as win32
+    import win32process
+
+    for attempt in range(1, attempts + 1):
+        # Callers may run this on a background thread; COM requires each
+        # thread that touches it to initialize its own apartment first,
+        # or Workbooks.Open can fail.
+        pythoncom.CoInitialize()
+        excel = None
+        excel_pid = None
+        tmp_dir = Path(tempfile.mkdtemp(prefix="workbook_com_"))
+        tmp_copy = tmp_dir / xlsx_path.name
+        try:
+            shutil.copy2(xlsx_path, tmp_copy)
+
+            excel = win32.Dispatch("Excel.Application")
+            try:
+                # Captured so cleanup can force-close *this specific*
+                # spawned instance if Quit() doesn't fully take — a
+                # leftover unresponsive EXCEL.EXE from one attempt was
+                # observed to cause the very next attempt to fail the
+                # same way, cascading retries into a solid wall of
+                # rejected calls. Never touches any other Excel process
+                # (e.g. one the user has open themselves).
+                excel_pid = win32process.GetWindowThreadProcessId(excel.Hwnd)[1]
+            except Exception:
+                pass
+            excel.Visible = False
+            excel.DisplayAlerts = False
+            wb = excel.Workbooks.Open(str(tmp_copy))
+            if wb is None:
+                # Seen during testing: under the same contention that
+                # causes RPC_E_CALL_REJECTED, Workbooks.Open can return
+                # None instead of raising. Route it through the same
+                # transient-retry path rather than failing with a
+                # confusing "'NoneType' has no attribute ..." later.
+                raise pywintypes.com_error(
+                    -2147418111, "Workbooks.Open returned no workbook (transient)", None, None
+                )
+            try:
+                wb.AutoSaveOn = False
+            except Exception:
+                pass
+            excel.CalculateFullRebuild()
+
+            sheet2 = wb.Sheets("Sheet2")
+            if refresh_pivot:
+                sheet2.PivotTables(1).RefreshTable()
+                excel.CalculateFullRebuild()
+
+            result = action(excel, wb, sheet2)
+            wb.Close(SaveChanges=False)
+            return result
+        except pywintypes.com_error as e:
+            transient = bool(e.args) and e.args[0] in _TRANSIENT_COM_HRESULTS
+            if transient and attempt < attempts:
+                time.sleep(retry_delay)
+                continue
+            raise
+        finally:
+            if excel is not None:
+                try:
+                    excel.Quit()
+                except Exception:
+                    pass
+                # A brief cooldown after quitting: back-to-back COM
+                # sessions (e.g. a retry, or a second tab/button click
+                # moments after the last one closed) reliably triggered
+                # "Call was rejected by callee" during testing without
+                # this — Excel/COM seems to want a beat after one
+                # process fully releases before the next activates
+                # cleanly.
+                time.sleep(0.5)
+                if excel_pid and _process_alive(excel_pid):
+                    _force_kill(excel_pid)
+                    time.sleep(0.3)
+            pythoncom.CoUninitialize()
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _validate_in_excel_direct(path: Path, log) -> None:
+    """The actual validate_in_excel implementation — only ever called
+    from a fresh worker subprocess (see validate_in_excel below for why).
+    Opens a *throwaway copy* of the generated file in real Excel, forces
+    a full recalc and a pivot refresh, and reports any formula errors
+    via `log(message)`. Degrades gracefully (skips with a note) if
+    Excel/pywin32 isn't available. See `_run_in_excel` for the OneDrive/
+    AutoSave-safety and transient-COM-retry details.
     """
     try:
-        import pythoncom
-        import win32com.client as win32
+        import pythoncom  # noqa: F401
+        import win32com.client as win32  # noqa: F401
     except ImportError:
         log("Skipped Excel validation (pywin32 not installed).")
         return
 
-    # Callers may run this on a background thread; COM requires each
-    # thread that touches it to initialize its own apartment first, or
-    # Workbooks.Open can fail.
-    pythoncom.CoInitialize()
-    excel = None
-    tmp_dir = Path(tempfile.mkdtemp(prefix="workbook_validate_"))
-    tmp_copy = tmp_dir / path.name
-    try:
-        shutil.copy2(path, tmp_copy)
-
-        excel = win32.gencache.EnsureDispatch("Excel.Application")
-        excel.Visible = False
-        excel.DisplayAlerts = False
-        wb = excel.Workbooks.Open(str(tmp_copy))
-        try:
-            wb.AutoSaveOn = False
-        except Exception:
-            pass
-        excel.CalculateFullRebuild()
-
+    def action(excel, wb, sheet2):
         data_ws = wb.Sheets("Data")
         last_row = data_ws.UsedRange.Rows.Count
 
@@ -1070,25 +1560,19 @@ def validate_in_excel(path: Path, log) -> None:
         else:
             log("[OK] No formula errors (#N/A / #NAME? / #VALUE!) after recalculation.")
 
+        # Independent try/except (not `refresh_pivot=True`) so a pivot
+        # refresh failure doesn't hide the formula-error results above.
         try:
-            pt = wb.Sheets("Sheet2").PivotTables(1)
-            pt.RefreshTable()
+            sheet2.PivotTables(1).RefreshTable()
             excel.CalculateFullRebuild()
             log("[OK] Pivot table refreshed successfully.")
         except Exception as e:
             log(f"[WARN] Could not refresh pivot table: {e}")
 
-        wb.Close(SaveChanges=False)
+    try:
+        _run_in_excel(path, action, refresh_pivot=False)
     except Exception as e:
         log(f"[WARN] Excel validation could not complete: {e}")
-    finally:
-        if excel is not None:
-            try:
-                excel.Quit()
-            except Exception:
-                pass
-        pythoncom.CoUninitialize()
-        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def _excel_cell_to_display(value):
@@ -1110,71 +1594,48 @@ def _excel_cell_to_display(value):
     return value
 
 
-def read_excel_pivot(xlsx_path: Path) -> dict:
-    """Opens a throwaway copy in real Excel (same OneDrive/AutoSave-safe
-    temp-copy pattern as validate_in_excel), refreshes the pivot table,
-    and reads back Sheet2's actual cell grid exactly as Excel renders it
-    — the literal pivot output, not `compute_pivot`'s Python reproduction.
-    Returns {"ok": True, "rows": [[...], ...]} or {"ok": False, "error": ...}.
+def _read_excel_pivot_direct(xlsx_path: Path) -> dict:
+    """The actual read_excel_pivot implementation — only ever called from
+    a fresh worker subprocess (see read_excel_pivot below for why). Opens
+    a throwaway copy in real Excel, refreshes the pivot table, and reads
+    back Sheet2's actual cell grid exactly as Excel renders it — the
+    literal pivot output, not `compute_pivot`'s Python reproduction. See
+    `_run_in_excel` for the OneDrive/AutoSave-safety and transient-COM-
+    retry details. Returns {"ok": True, "rows": [[...], ...]} or
+    {"ok": False, "error": ...}.
     """
     try:
-        import pythoncom
-        import win32com.client as win32
+        import pythoncom  # noqa: F401
+        import win32com.client as win32  # noqa: F401
     except ImportError:
         return {"ok": False, "error": "Excel (pywin32) is not available on this machine."}
 
-    pythoncom.CoInitialize()
-    excel = None
-    tmp_dir = Path(tempfile.mkdtemp(prefix="workbook_pivot_"))
-    tmp_copy = tmp_dir / xlsx_path.name
-    try:
-        shutil.copy2(xlsx_path, tmp_copy)
-
-        excel = win32.gencache.EnsureDispatch("Excel.Application")
-        excel.Visible = False
-        excel.DisplayAlerts = False
-        wb = excel.Workbooks.Open(str(tmp_copy))
-        try:
-            wb.AutoSaveOn = False
-        except Exception:
-            pass
-        excel.CalculateFullRebuild()
-
-        sheet2 = wb.Sheets("Sheet2")
-        sheet2.PivotTables(1).RefreshTable()
-        excel.CalculateFullRebuild()
-
+    def action(excel, wb, sheet2):
         raw = sheet2.UsedRange.Value
-        wb.Close(SaveChanges=False)
-
         if raw is None:
-            rows = []
-        elif isinstance(raw, tuple) and raw and isinstance(raw[0], tuple):
-            rows = [[_excel_cell_to_display(c) for c in r] for r in raw]
-        elif isinstance(raw, tuple):
-            rows = [[_excel_cell_to_display(c) for c in raw]]
-        else:
-            rows = [[_excel_cell_to_display(raw)]]
+            return []
+        if isinstance(raw, tuple) and raw and isinstance(raw[0], tuple):
+            return [[_excel_cell_to_display(c) for c in r] for r in raw]
+        if isinstance(raw, tuple):
+            return [[_excel_cell_to_display(c) for c in raw]]
+        return [[_excel_cell_to_display(raw)]]
 
+    try:
+        rows = _run_in_excel(xlsx_path, action, refresh_pivot=True)
         return {"ok": True, "rows": rows}
     except Exception as e:
         return {"ok": False, "error": str(e)}
-    finally:
-        if excel is not None:
-            try:
-                excel.Quit()
-            except Exception:
-                pass
-        pythoncom.CoUninitialize()
-        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def copy_excel_pivot_to_clipboard(xlsx_path: Path) -> dict:
-    """Opens a throwaway copy in real Excel, refreshes the pivot table,
-    and has Excel itself copy Sheet2's used range — giving an exact match
-    of Excel's own rendering (cell colors, bold subtotal rows, borders,
-    blank-vs-zero, the works) on paste, since it genuinely is Excel doing
-    the copy rather than a reconstruction.
+def _copy_excel_pivot_to_clipboard_direct(xlsx_path: Path) -> dict:
+    """The actual copy_excel_pivot_to_clipboard implementation — only
+    ever called from a fresh worker subprocess (see
+    copy_excel_pivot_to_clipboard below for why). Opens a throwaway copy
+    in real Excel, refreshes the pivot table, and has Excel itself copy
+    Sheet2's used range — giving an exact match of Excel's own rendering
+    (cell colors, bold subtotal rows, borders, blank-vs-zero, the works)
+    on paste, since it genuinely is Excel doing the copy rather than a
+    reconstruction.
 
     Excel puts a rich set of formats on the clipboard while it's still
     running (confirmed: HTML Format, RTF, native Biff, CSV, ...) but only
@@ -1187,37 +1648,16 @@ def copy_excel_pivot_to_clipboard(xlsx_path: Path) -> dict:
     itself via win32clipboard — confirmed this makes "HTML Format"
     reliably survive after Excel's process is gone.
 
-    Paste with Ctrl+V into Excel/Outlook/Word/Teams. Returns
-    {"ok": True} or {"ok": False, "error": ...}.
+    Paste with Ctrl+V into Excel/Outlook/Word/Teams. See `_run_in_excel`
+    for the OneDrive/AutoSave-safety and transient-COM-retry details.
+    Returns {"ok": True} or {"ok": False, "error": ...}.
     """
     try:
-        import pythoncom
         import win32clipboard
-        import win32com.client as win32
     except ImportError:
         return {"ok": False, "error": "Excel (pywin32) is not available on this machine."}
 
-    pythoncom.CoInitialize()
-    excel = None
-    tmp_dir = Path(tempfile.mkdtemp(prefix="workbook_pivot_copy_"))
-    tmp_copy = tmp_dir / xlsx_path.name
-    try:
-        shutil.copy2(xlsx_path, tmp_copy)
-
-        excel = win32.gencache.EnsureDispatch("Excel.Application")
-        excel.Visible = False
-        excel.DisplayAlerts = False
-        wb = excel.Workbooks.Open(str(tmp_copy))
-        try:
-            wb.AutoSaveOn = False
-        except Exception:
-            pass
-        excel.CalculateFullRebuild()
-
-        sheet2 = wb.Sheets("Sheet2")
-        sheet2.PivotTables(1).RefreshTable()
-        excel.CalculateFullRebuild()
-
+    def action(excel, wb, sheet2):
         sheet2.UsedRange.Copy()
         time.sleep(0.3)  # let Excel finish rendering clipboard formats
 
@@ -1230,34 +1670,119 @@ def copy_excel_pivot_to_clipboard(xlsx_path: Path) -> dict:
             text_data = win32clipboard.GetClipboardData(win32clipboard.CF_UNICODETEXT)
         finally:
             win32clipboard.CloseClipboard()
+        return (html_fmt, rtf_fmt, html_bytes, rtf_bytes, text_data)
 
-        wb.Close(SaveChanges=False)
-        excel.Quit()
-        excel = None
-
-        # Re-own the clipboard ourselves with the captured bytes, now
-        # that Excel is fully gone — this is the part that actually
-        # persists.
-        win32clipboard.OpenClipboard()
-        try:
-            win32clipboard.EmptyClipboard()
-            win32clipboard.SetClipboardData(html_fmt, html_bytes)
-            win32clipboard.SetClipboardData(rtf_fmt, rtf_bytes)
-            win32clipboard.SetClipboardData(win32clipboard.CF_UNICODETEXT, text_data)
-        finally:
-            win32clipboard.CloseClipboard()
-
-        return {"ok": True}
+    try:
+        html_fmt, rtf_fmt, html_bytes, rtf_bytes, text_data = _run_in_excel(xlsx_path, action, refresh_pivot=True)
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+    # Re-own the clipboard ourselves with the captured bytes, now that
+    # Excel (closed inside _run_in_excel) is fully gone — this is the
+    # part that actually persists.
+    win32clipboard.OpenClipboard()
+    try:
+        win32clipboard.EmptyClipboard()
+        win32clipboard.SetClipboardData(html_fmt, html_bytes)
+        win32clipboard.SetClipboardData(rtf_fmt, rtf_bytes)
+        win32clipboard.SetClipboardData(win32clipboard.CF_UNICODETEXT, text_data)
     finally:
-        if excel is not None:
-            try:
-                excel.Quit()
-            except Exception:
-                pass
-        pythoncom.CoUninitialize()
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        win32clipboard.CloseClipboard()
+
+    return {"ok": True}
+
+
+# --- Subprocess worker: the real fix for RPC_E_CALL_REJECTED -----------
+#
+# Root-caused during development: within one long-lived process (this is
+# exactly how the Flask dev server runs — single process, handling every
+# request), the *first* Excel COM automation call always succeeded, and
+# *every* call after that — even from a brand-new dedicated thread — then
+# reliably failed with "Call was rejected by callee", regardless of
+# delays or retry counts. Every genuinely separate process invocation
+# succeeded, 100% reproducibly across many trials. So each of the three
+# public functions below spawns this same script as a one-shot
+# subprocess to do the actual Excel work, guaranteeing a pristine
+# process every time — cheap relative to Excel automation's own runtime,
+# and the only approach that's been fully reliable.
+#
+# The subprocess writes its JSON result to a temp file (passed as an
+# argument) rather than stdout, sidestepping any buffering/encoding
+# edge cases with large pivot payloads.
+
+def _run_excel_worker(action: str, xlsx_path: Path) -> dict:
+    """Runs one Excel-COM action ("validate" / "read_pivot" /
+    "copy_clipboard") in a fresh subprocess and returns its JSON result.
+    `copy_clipboard`'s effect (writing to the Windows clipboard) is
+    system-wide and outlives the subprocess, same as it would in-process.
+    """
+    result_path = Path(tempfile.gettempdir()) / f"excel_worker_result_{os.getpid()}_{id(object())}.json"
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), "--excel-worker", action, str(xlsx_path), str(result_path)],
+            capture_output=True, text=True, timeout=150,
+        )
+        if result_path.exists():
+            with open(result_path, encoding="utf-8") as f:
+                return json.load(f)
+        stderr_tail = (proc.stderr or "").strip()
+        return {
+            "ok": False,
+            "error": stderr_tail[-2000:] if stderr_tail else f"Excel worker exited with code {proc.returncode} and no result.",
+        }
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "Excel automation timed out."}
+    finally:
+        result_path.unlink(missing_ok=True)
+
+
+def validate_in_excel(path: Path, log) -> None:
+    """Public entry point: runs `_validate_in_excel_direct` in a fresh
+    worker subprocess (see the block comment above) and replays its log
+    lines through `log(message)`, preserving the original calling
+    convention."""
+    result = _run_excel_worker("validate", path)
+    for line in result.get("log", []):
+        log(line)
+    if "error" in result:
+        log(f"[WARN] Excel validation could not complete: {result['error']}")
+
+
+def read_excel_pivot(xlsx_path: Path) -> dict:
+    """Public entry point: runs `_read_excel_pivot_direct` in a fresh
+    worker subprocess (see the block comment above). Returns
+    {"ok": True, "rows": [[...], ...]} or {"ok": False, "error": ...}."""
+    return _run_excel_worker("read_pivot", xlsx_path)
+
+
+def copy_excel_pivot_to_clipboard(xlsx_path: Path) -> dict:
+    """Public entry point: runs `_copy_excel_pivot_to_clipboard_direct`
+    in a fresh worker subprocess (see the block comment above). Returns
+    {"ok": True} or {"ok": False, "error": ...}."""
+    return _run_excel_worker("copy_clipboard", xlsx_path)
+
+
+def _excel_worker_entrypoint(argv: list[str]) -> None:
+    """Invoked as `py generate_workbook.py --excel-worker <action> <xlsx_path> <result_json_path>`
+    — does exactly one Excel-COM action and writes its JSON result to
+    the given path, then exits. See the block comment above `_run_excel_worker`."""
+    action, xlsx_path_str, result_path_str = argv[0], argv[1], argv[2]
+    xlsx_path = Path(xlsx_path_str)
+    result_path = Path(result_path_str)
+
+    if action == "validate":
+        logs: list[str] = []
+        _validate_in_excel_direct(xlsx_path, logs.append)
+        result = {"log": logs}
+    elif action == "read_pivot":
+        result = _read_excel_pivot_direct(xlsx_path)
+    elif action == "copy_clipboard":
+        result = _copy_excel_pivot_to_clipboard_direct(xlsx_path)
+    else:
+        result = {"ok": False, "error": f"Unknown --excel-worker action: {action!r}"}
+
+    with open(result_path, "w", encoding="utf-8") as f:
+        json.dump(result, f)
 
 
 def main():
@@ -1281,4 +1806,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "--excel-worker":
+        _excel_worker_entrypoint(sys.argv[2:])
+    else:
+        main()

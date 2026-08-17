@@ -157,6 +157,7 @@ def view():
     rows = []
     excel_pivot = None
     aging = []
+    aging_stats = None
     email_draft = None
     if path is None:
         error = "No generated workbook found yet — generate one first."
@@ -173,6 +174,8 @@ def view():
                 excel_pivot = gw.read_excel_pivot(path)
             elif tab == "email_draft":
                 email_draft = gw.build_email_draft(rows, aging)
+            elif tab == "aging":
+                aging_stats = gw.compute_aging_stats(aging)
         except Exception as e:
             error = str(e)
 
@@ -182,6 +185,7 @@ def view():
         selected_file=path.name if path else "",
         tab=tab,
         rows=rows,
+        aging_stats=aging_stats,
         excel_pivot=excel_pivot,
         aging=aging,
         email_draft=email_draft,
@@ -196,6 +200,21 @@ def copy_excel_pivot():
     if path is None:
         return {"ok": False, "error": f"File not found: {filename}"}, 404
     return gw.copy_excel_pivot_to_clipboard(path)
+
+
+@app.route("/view/generate-ai-email", methods=["POST"])
+def generate_ai_email():
+    filename = request.form.get("file", "")
+    path = _resolve_file(filename)
+    if path is None:
+        return {"ok": False, "error": f"File not found: {filename}"}, 404
+    try:
+        rows = gw.read_generated_rows(path)
+        aging = gw.compute_aging(rows)
+        text = gw.build_email_draft_ai(rows, aging)
+        return {"ok": True, "text": text}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}, 500
 
 
 @app.route("/match", methods=["GET"])
@@ -302,4 +321,11 @@ def shutdown():
 
 if __name__ == "__main__":
     print(f"Open http://127.0.0.1:{PORT}/ in your browser.")
-    app.run(host="127.0.0.1", port=PORT, debug=False)
+    # threaded=True: the AI email draft (/view/generate-ai-email) can take
+    # a minute or more running a local LLM — without this, that single
+    # request would block every other tab/request in the app until it
+    # finishes. Safe here: the Excel-COM work (the one thing that ever
+    # needed single-process isolation) already runs in its own subprocess
+    # per call (see generate_workbook._run_excel_worker), so it's
+    # unaffected by Flask's threading model either way.
+    app.run(host="127.0.0.1", port=PORT, debug=False, threaded=True)

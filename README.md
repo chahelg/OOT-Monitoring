@@ -27,11 +27,19 @@ a proprietary format or a hosted service.
   table (refreshed via Excel automation, not a reconstruction) right in
   the browser, with one-click copy that preserves Excel's actual
   formatting on paste.
-- **Aging**: flags alert categories that are still open past a 48-hour
-  window, based on how long each has been appearing in the data.
+- **Aging**: a dashboard (stat tiles, a ranked bar chart, a legend) of
+  which alert categories are still open past a 48-hour window, based on
+  how long each has been appearing in the data, plus the full detail
+  table below it.
 - **Email Draft**: auto-writes a draft of the daily observations email
   from the aging data, using one disclosed rule for "recurring vs. new
-  spike" framing — always a draft to review, never auto-sent.
+  spike" framing — always a draft to review, never auto-sent. A second,
+  optional **AI-drafted email** sits alongside it: a local language
+  model (via [Ollama](https://ollama.com), nothing sent over the
+  network) writes the analytical commentary — which categories are
+  worth calling out, spike/recurring/declining framing — while every
+  number, date, and count stays computed by plain Python, never by the
+  model. See "Optional: AI-drafted email" below.
 - **Match Rules**: view, add, edit, and delete the classification rules
   directly in the browser instead of hand-editing the sheet.
 
@@ -60,6 +68,26 @@ py webapp.py
 ```
 
 then open `http://127.0.0.1:8765/`.
+
+## Optional: AI-drafted email
+
+The rule-based Email Draft always works with no setup. The AI-drafted
+version next to it needs [Ollama](https://ollama.com) installed and
+running locally, with a model pulled:
+
+```
+ollama pull qwen2.5:7b
+```
+
+Nothing about this feature calls out to an external API — it's a
+plain HTTP request to `localhost:11434`, so today's alert data (error
+text, business object keys, service names, internal URLs) never leaves
+the machine. Without Ollama running, that one button just shows an
+error; every other feature is unaffected. On a CPU-only machine expect
+it to take anywhere from under a minute to several minutes, since it
+makes several small, isolated model calls per email rather than one —
+see `build_email_draft_ai`'s docstring in `generate_workbook.py` for
+why.
 
 ## Files
 
