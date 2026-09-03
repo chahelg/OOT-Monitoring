@@ -26,7 +26,17 @@ a proprietary format or a hosted service.
 - **View Table**: browse the generated Data sheet and the real pivot
   table (refreshed via Excel automation, not a reconstruction) right in
   the browser, with one-click copy that preserves Excel's actual
-  formatting on paste.
+  formatting on paste. "Choose File…" opens the native Windows file
+  dialog so you can load any `.xlsx` from anywhere on disk, not just
+  ones already generated here — it's copied into `output/` (never
+  overwriting a same-named file already there) so every tab works on
+  it exactly like a normal generated workbook.
+- **History**: trend across every daily file in your archive folders —
+  daily volume, per-stream trends, and a searchable log of every past
+  alert — deduplicated across overlapping daily exports so the same
+  real alert re-exported on multiple days is never double-counted. If
+  today's file is still open in Excel when this tab loads, it reads a
+  throwaway copy instead of skipping it.
 - **Aging**: a dashboard (stat tiles, a ranked bar chart, a legend) of
   which alert categories are still open past a 48-hour window, based on
   how long each has been appearing in the data, plus the full detail
