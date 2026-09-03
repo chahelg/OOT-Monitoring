@@ -32,11 +32,15 @@ a proprietary format or a hosted service.
   overwriting a same-named file already there) so every tab works on
   it exactly like a normal generated workbook.
 - **History**: trend across every daily file in your archive folders —
-  daily volume, per-stream trends, and a searchable log of every past
-  alert — deduplicated across overlapping daily exports so the same
-  real alert re-exported on multiple days is never double-counted. If
-  today's file is still open in Excel when this tab loads, it reads a
-  throwaway copy instead of skipping it.
+  daily volume and per-stream trends — deduplicated across overlapping
+  daily exports so the same real alert re-exported on multiple days is
+  never double-counted. If today's file is still open in Excel when
+  this tab loads, it reads a throwaway copy instead of skipping it.
+  Includes a **search box** that finds every day a specific error
+  fired, or looks up which error(s) a business object key appeared
+  under — matching against error/alert messages, error details,
+  business object key, application, service, and transaction URL,
+  across the full multi-day history, not just one file.
 - **Aging**: a dashboard (stat tiles, a ranked bar chart, a legend) of
   which alert categories are still open past a 48-hour window, based on
   how long each has been appearing in the data, plus the full detail
