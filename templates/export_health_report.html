@@ -1,0 +1,430 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Integration Health Report{% if report %} — {{ report.file_name }}{% endif %}</title>
+<style>
+  /* Self-contained by design — no linked stylesheet, no CDN, no web
+     fonts, no network calls. This page is meant to be printed, saved
+     as PDF, or its content copied straight into an email, so it can't
+     depend on anything outside itself. Severity color stays reserved
+     for P1/P2/P3 (deep red / amber / neutral grey), same as the live
+     page; everything else is deliberately monochrome. */
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: #f2f4f8;
+    color: #1c2430;
+    font-family: "Segoe UI", Arial, sans-serif;
+    font-size: 13px;
+    line-height: 1.5;
+  }
+  .export-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 12px;
+    background: #fff;
+    border-bottom: 1px solid #e0e4ea;
+    padding: 12px 24px;
+  }
+  .export-toolbar-group { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .export-toolbar a {
+    font-size: 12.5px;
+    font-weight: 600;
+    color: #1e3f8f;
+    text-decoration: none;
+    padding: 5px 10px;
+    border-radius: 6px;
+    border: 1px solid #e0e4ea;
+  }
+  .export-toolbar a.active { background: #1e3f8f; border-color: #1e3f8f; color: #fff; }
+  .export-toolbar button {
+    font-size: 12.5px;
+    font-weight: 600;
+    padding: 6px 14px;
+    border-radius: 6px;
+    border: 1px solid #1e3f8f;
+    background: #1e3f8f;
+    color: #fff;
+    cursor: pointer;
+  }
+  .export-toolbar button.btn-secondary { background: #fff; color: #1e3f8f; }
+  .export-copy-feedback { font-size: 12px; color: #1c9a6c; font-weight: 600; }
+
+  #export-content { max-width: 900px; margin: 0 auto; padding: 24px 24px 60px; }
+
+  .report-title { font-size: 21px; font-weight: 700; margin: 0 0 4px; }
+  .report-subtitle { font-size: 12.5px; color: #6b7686; margin: 0 0 20px; }
+  .confidential-tag {
+    display: inline-block; font-size: 10.5px; font-weight: 700; letter-spacing: 0.04em;
+    color: #b8860b; border: 1px solid #b8860b; border-radius: 4px; padding: 1px 8px; margin-left: 8px;
+  }
+
+  .band {
+    background: #fff;
+    border: 1px solid #e0e4ea;
+    border-radius: 10px;
+    padding: 20px 22px;
+    margin-bottom: 18px;
+  }
+  .band h2 { font-size: 14px; font-weight: 700; margin: 0 0 14px; color: #1c2430; }
+  .band-note { font-size: 11.5px; color: #6b7686; margin: 0 0 12px; }
+
+  .verdict-sentence { font-size: 15px; font-weight: 600; margin: 0 0 16px; }
+
+  .headline-grid { display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; }
+  .headline-tile { border: 1px solid #e0e4ea; border-top: 3px solid #e0e4ea; border-radius: 8px; padding: 10px 12px; }
+  .headline-tile.critical { border-top-color: #d5372c; }
+  .stat-label { font-size: 10.5px; font-weight: 600; color: #6b7686; margin-bottom: 4px; }
+  .stat-value { font-size: 21px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .stat-unit { font-size: 12px; font-weight: 600; color: #6b7686; }
+
+  table { border-collapse: collapse; width: 100%; font-size: 11.5px; }
+  table th, table td { padding: 6px 8px; border-bottom: 1px solid #e0e4ea; text-align: left; vertical-align: top; }
+  table th { background: #f7f8fb; font-weight: 700; }
+  .tabular-nums { font-variant-numeric: tabular-nums; }
+  .table-scroll { overflow-x: auto; }
+
+  .priority-label { font-weight: 700; font-size: 11.5px; }
+  .queue-issue-name { font-weight: 600; }
+  .queue-issue-sub { font-size: 10.5px; color: #6b7686; margin-top: 1px; }
+  .dual-measure-primary { font-weight: 700; }
+  .dual-measure-unit, .dual-measure-secondary { color: #6b7686; font-size: 10.5px; }
+  .dual-measure-sep { color: #c7ccd6; margin: 0 3px; }
+  .flag-glyph {
+    display: inline-block; border: 1px solid #6b7686; border-radius: 4px; padding: 0px 5px;
+    font-size: 9px; font-weight: 700; margin-right: 3px; white-space: nowrap;
+  }
+  .trend-arrow { color: #6b7686; margin-left: 4px; }
+
+  .aging-bar { display: flex; height: 12px; border-radius: 3px; overflow: hidden; background: #f2f4f8; min-width: 90px; }
+  .aging-seg { height: 100%; }
+
+  .badge-escalate {
+    display: inline-block; background: #d5372c; color: #fff; font-size: 10px; font-weight: 700;
+    border-radius: 8px; padding: 1px 8px;
+  }
+
+  .movement-chart-labels { display: flex; justify-content: space-between; font-size: 10.5px; color: #6b7686; margin: 2px 0 16px; }
+  .movement-columns { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+  .movement-col h3 { font-size: 11.5px; font-weight: 700; margin: 0 0 6px; }
+  .movement-list { list-style: none; margin: 0; padding: 0; font-size: 11px; }
+  .movement-list li { padding: 5px 0; border-bottom: 1px solid #eef0f4; }
+  .movement-item-title { display: flex; align-items: baseline; gap: 6px; }
+  .movement-item-title .priority-label { font-size: 9.5px; }
+  .movement-item-sub { font-size: 10px; color: #6b7686; margin-top: 1px; }
+
+  .status-pill { display: inline-block; border-radius: 8px; padding: 1px 8px; font-size: 10px; font-weight: 700; background: #e0e4ea; color: #6b7686; }
+  .status-pill-fail { background: #d5372c; color: #fff; }
+  .status-pill-warn { background: #b8860b; color: #fff; }
+
+  .report-footer {
+    max-width: 900px; margin: 0 auto; padding: 14px 24px 30px;
+    font-size: 10.5px; color: #6b7686; border-top: 1px solid #e0e4ea;
+  }
+
+  .error-box { max-width: 900px; margin: 40px auto; background: #fdecea; border: 1px solid #f3b9b2; border-radius: 10px; padding: 20px 22px; }
+
+  @media print {
+    .no-print { display: none !important; }
+    body { background: #fff; }
+    #export-content { max-width: none; padding: 0; }
+    @page { size: A4 portrait; margin: 14mm 12mm 20mm; }
+    .band { border: none; border-bottom: 1px solid #e0e4ea; border-radius: 0; box-shadow: none; break-inside: avoid; page-break-inside: avoid; }
+    table thead { display: table-header-group; }
+    table tr { break-inside: avoid; page-break-inside: avoid; }
+    .movement-col { break-inside: avoid; page-break-inside: avoid; }
+    .report-footer { position: fixed; bottom: 0; left: 0; right: 0; max-width: none; background: #fff; }
+  }
+
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+</style>
+</head>
+<body>
+
+{% if error %}
+  <div class="error-box">
+    <strong>Can't build the report.</strong>
+    <p>{{ error }}</p>
+  </div>
+{% else %}
+
+  <div class="export-toolbar no-print">
+    <div class="export-toolbar-group">
+      <a href="{{ url_for('export_health_report', file=selected_file, mode='full', contacts='full' if contacts_full else none) }}"
+         class="{{ 'active' if mode == 'full' else '' }}">Full report</a>
+      <a href="{{ url_for('export_health_report', file=selected_file, mode='brief', contacts='full' if contacts_full else none) }}"
+         class="{{ 'active' if mode == 'brief' else '' }}">Brief (management summary)</a>
+    </div>
+    <div class="export-toolbar-group">
+      {% if contacts_full %}
+      <a href="{{ url_for('export_health_report', file=selected_file, mode=mode) }}">Names only (hide emails)</a>
+      {% else %}
+      <a href="{{ url_for('export_health_report', file=selected_file, mode=mode, contacts='full') }}">Show full contact details</a>
+      {% endif %}
+    </div>
+    <div class="export-toolbar-group">
+      <button type="button" onclick="window.print()">Save as PDF / Print</button>
+      <button type="button" class="btn-secondary" onclick="copyReportForEmail()">Copy for email</button>
+      <span id="export-copy-feedback" class="export-copy-feedback"></span>
+    </div>
+    <div class="export-toolbar-group">
+      <a href="{{ url_for('view', file=selected_file, tab='aging') }}">&larr; Back to live report</a>
+    </div>
+  </div>
+
+  <div id="export-content">
+    <h1 class="report-title">Integration Health Report<span class="confidential-tag">CONFIDENTIAL — INTERNAL</span></h1>
+    <p class="report-subtitle">{{ report.file_name }} · data through {{ report.file_date.strftime('%Y-%m-%d') if report.file_date else 'n/a' }}
+      · generated {{ report.generated_at.strftime('%Y-%m-%d %H:%M') }}{% if mode == 'brief' %} · management summary{% endif %}
+      {%- if not contacts_full %} · contacts shown as names only{% endif %}</p>
+
+    {% if not report.interface_matrix_available %}
+    <div class="band" style="background:#fff8e6; border-color:#f0d99a;">
+      <strong>Interface matrix not loaded.</strong> Criticality, ownership, and interface names below are
+      unavailable and shown as "Unknown" / "Unmapped" — counts and priorities are still correct.
+    </div>
+    {% endif %}
+
+    <div class="band">
+      <h2>Verdict</h2>
+      <p class="verdict-sentence">{{ report.verdict }}</p>
+      <div class="headline-grid">
+        <div class="headline-tile {{ 'critical' if report.headline.p1_open else '' }}">
+          <div class="stat-label">P1 open</div>
+          <div class="stat-value">{{ report.headline.p1_open }}</div>
+        </div>
+        <div class="headline-tile">
+          <div class="stat-label">Documents stuck</div>
+          <div class="stat-value">{{ report.headline.docs_stuck }}</div>
+        </div>
+        <div class="headline-tile">
+          <div class="stat-label">FI-impacting</div>
+          <div class="stat-value">{{ report.headline.fi_impacting }}</div>
+        </div>
+        <div class="headline-tile">
+          <div class="stat-label">Streams at risk</div>
+          <div class="stat-value">{{ report.headline.streams_at_risk }}</div>
+        </div>
+        <div class="headline-tile">
+          <div class="stat-label">Oldest issue</div>
+          <div class="stat-value">{{ report.headline.oldest_days|round(1) }}<span class="stat-unit">d</span></div>
+        </div>
+        <div class="headline-tile">
+          <div class="stat-label">Net vs. yesterday</div>
+          <div class="stat-value">{{ '+' if report.headline.net_vs_yesterday > 0 else '' }}{{ report.headline.net_vs_yesterday }}</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="band">
+      <h2>Priority queue <span class="band-note" style="display:inline;">({{ report.queue_total }} issue{{ 's' if report.queue_total != 1 else '' }})</span></h2>
+      <p class="band-note">Sorted by weighted score (criticality, FI impact, age, blast radius, volume, trend) — not raw alert count.
+        FI = financial posting impact · Stock = stock movement · Time-critical = time-critical interface.</p>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>Priority</th><th>Stream</th><th>Issue</th><th>Documents / Alerts</th>
+              <th>Age</th><th>Trend</th><th>Flags</th><th>Owners</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in report.queue_default + report.queue_extra %}
+            <tr style="border-left: 3px solid {{ '#d5372c' if row.priority == 'P1' else ('#b8860b' if row.priority == 'P2' else '#6b7686') }};">
+              <td><span class="priority-label" style="color: {{ '#d5372c' if row.priority == 'P1' else ('#b8860b' if row.priority == 'P2' else '#6b7686') }};">{{ row.priority }}</span></td>
+              <td>{{ row.stream }}</td>
+              <td>
+                <div class="queue-issue-name">{{ row.interface_name or row.error_category }}</div>
+                <div class="queue-issue-sub">{{ row.error_category }}{% if row.application %} · {{ row.application }}{% endif -%}
+                  {%- if row.match_state in ('ambiguous', 'unmatched') %} ({{ row.match_state }} match){% endif -%}
+                  {%- if row.enrichment_confidence != 'full' %} ({{ row.enrichment_confidence }} data){% endif -%}
+                  {%- if row.priority_reasons %} — {{ row.priority_reasons|join('; ') }}{% endif %}</div>
+              </td>
+              <td class="tabular-nums">
+                {% if row.docs_alerts_differ %}
+                <span class="dual-measure-primary">{{ row.distinct_objects }}</span><span class="dual-measure-unit"> doc{{ 's' if row.distinct_objects != 1 else '' }}</span>
+                <span class="dual-measure-sep">·</span><span class="dual-measure-secondary">{{ row.alert_count }} alert{{ 's' if row.alert_count != 1 else '' }}</span>
+                {% else %}
+                <span class="dual-measure-primary">{{ row.alert_count }}</span><span class="dual-measure-unit"> alert{{ 's' if row.alert_count != 1 else '' }}</span>
+                {% endif %}
+              </td>
+              <td class="tabular-nums">{{ row.age_label }}</td>
+              <td class="tabular-nums">{{ row.trend_arrow }}</td>
+              <td>{% for f in row.flags %}<span class="flag-glyph">{{ f }}</span>{% endfor %}</td>
+              <td>{{ row.owners|join(', ') if row.owners else '—' }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="band">
+      <h2>Ownership</h2>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr><th>Stream</th><th>P1</th><th>Open issues</th><th>Documents / Alerts</th><th>Oldest</th><th>Age distribution</th><th>Contacts</th><th></th></tr>
+          </thead>
+          <tbody>
+            {% for row in report.ownership %}
+            <tr>
+              <td>{{ row.stream }}</td>
+              <td class="tabular-nums">{{ row.p1_count }}</td>
+              <td class="tabular-nums">{{ row.open_count }}</td>
+              <td class="tabular-nums">
+                {% if row.docs_alerts_differ %}
+                <span class="dual-measure-primary">{{ row.distinct_objects }}</span><span class="dual-measure-unit"> docs</span>
+                <span class="dual-measure-sep">·</span><span class="dual-measure-secondary">{{ row.alert_count }} alerts</span>
+                {% else %}
+                <span class="dual-measure-primary">{{ row.alert_count }}</span><span class="dual-measure-unit"> alerts</span>
+                {% endif %}
+              </td>
+              <td class="tabular-nums">{{ row.oldest_days|round(1) }}d</td>
+              <td>
+                <div class="aging-bar" title="&lt;24h: {{ row.aging_buckets['<24h'] }} · 1-2d: {{ row.aging_buckets['1-2d'] }} · 3-7d: {{ row.aging_buckets['3-7d'] }} · &gt;7d: {{ row.aging_buckets['>7d'] }}">
+                  <span class="aging-seg" style="flex-grow:{{ row.aging_buckets['<24h'] }}; background:#e4e7ee;"></span>
+                  <span class="aging-seg" style="flex-grow:{{ row.aging_buckets['1-2d'] }}; background:#b7c0cf;"></span>
+                  <span class="aging-seg" style="flex-grow:{{ row.aging_buckets['3-7d'] }}; background:#7c8798;"></span>
+                  <span class="aging-seg" style="flex-grow:{{ row.aging_buckets['>7d'] }}; background:#3a4250;"></span>
+                </div>
+              </td>
+              <td>{{ row.contacts|join(', ') if row.contacts else '—' }}</td>
+              <td>{% if row.escalate %}<span class="badge-escalate">ESCALATE</span>{% endif %}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    {% macro movement_item(m, date_kind) %}
+    <li>
+      <div class="movement-item-title">
+        <span class="priority-label" style="color: {{ '#d5372c' if m.priority == 'P1' else ('#b8860b' if m.priority == 'P2' else '#6b7686') }};">{{ m.priority }}</span>
+        [{{ m.stream }}] {{ m.interface_name or m.error_category }}
+      </div>
+      <div class="movement-item-sub">
+        {% if m.docs_alerts_differ %}{{ m.distinct_objects }} doc{{ 's' if m.distinct_objects != 1 else '' }} · {{ m.alert_count }} alert{{ 's' if m.alert_count != 1 else '' }}
+        {%- else %}{{ m.alert_count }} alert{{ 's' if m.alert_count != 1 else '' }}{% endif -%}
+        {%- if date_kind == 'first' %} · first seen {{ m.first_seen_label }}
+        {%- else %} · last seen {{ m.last_seen_label }}{% endif %}
+      </div>
+    </li>
+    {% endmacro %}
+
+    <div class="band">
+      <h2>Movement <span class="band-note" style="display:inline;">— 14-day distinct documents affected</span></h2>
+      {% if report.movement.series_svg %}
+      {{ report.movement.series_svg|safe }}
+      <div class="movement-chart-labels"><span>{{ report.movement.series_start_label }}</span><span>{{ report.movement.series_end_label }}</span></div>
+      {% else %}
+      <p class="band-note">No multi-day history available yet.</p>
+      {% endif %}
+      <div class="movement-columns">
+        <div class="movement-col">
+          <h3>Cleared since yesterday ({{ report.movement.cleared|length }})</h3>
+          {% if report.movement.cleared %}
+          <ul class="movement-list">{% for m in report.movement.cleared %}{{ movement_item(m, 'last') }}{% endfor %}</ul>
+          {% else %}<p class="band-note">None.</p>{% endif %}
+        </div>
+        <div class="movement-col">
+          <h3>New today ({{ report.movement.new_today|length }})</h3>
+          {% if report.movement.new_today %}
+          <ul class="movement-list">{% for m in report.movement.new_today %}{{ movement_item(m, 'first') }}{% endfor %}</ul>
+          {% else %}<p class="band-note">None.</p>{% endif %}
+        </div>
+        <div class="movement-col">
+          <h3>Recurring ({{ report.movement.recurring|length }})</h3>
+          {% if report.movement.recurring %}
+          <ul class="movement-list">{% for m in report.movement.recurring %}{{ movement_item(m, 'last') }}{% endfor %}</ul>
+          {% else %}<p class="band-note">None.</p>{% endif %}
+        </div>
+      </div>
+    </div>
+
+    {% if mode == 'full' and aging is not none %}
+    <div class="band">
+      <h2>Full detail table <span class="band-note" style="display:inline;">— every category, every column</span></h2>
+      <p class="band-note">Flagged if the earliest occurrence of that category is more than 48 hours old. Sorted worst (oldest) first, then by count.</p>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>Status</th><th>Alert type</th><th>Grouping</th><th>Count</th><th>First seen</th><th>Age (days)</th><th>Pattern</th>
+              <th>Stream</th><th>Interface Name</th><th>Middleware</th><th>S4 Tech</th><th>Mode</th><th>Direction</th><th>Datadog App</th><th>Contact</th><th>Sample error</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for r in aging %}
+            <tr>
+              <td>{% if r.flagged %}<span class="status-pill status-pill-fail">STALE</span>
+                  {% elif r.is_new_spike %}<span class="status-pill status-pill-warn">NEW SPIKE</span>
+                  {% else %}<span class="status-pill">OK</span>{% endif %}</td>
+              <td>{{ r.alert_type }}</td>
+              <td>{{ r.grouping }}</td>
+              <td class="tabular-nums">{{ r.count }}</td>
+              <td>{{ r.earliest.strftime('%Y-%m-%d') }}</td>
+              <td class="tabular-nums">{{ r.age_days }}</td>
+              <td>{{ 'Recurring' if r.is_recurring else ('New spike' if r.is_new_spike else '') }}</td>
+              {% if r.interface.status == 'resolved' %}
+              <td>{{ r.interface.row.stream }}</td>
+              <td>{{ r.interface.row.interface_name }}{% if r.interface.spans_multiple %} (+{{ r.interface.distinct_count - 1 }} more){% endif %}</td>
+              <td>{{ r.interface.row.middleware }}</td>
+              <td>{{ r.interface.row.s4_integration_tech }}</td>
+              <td>{{ r.interface.row.interface_mode }}</td>
+              <td>{{ r.interface.row.message_direction }}</td>
+              <td>{{ r.interface.app_names|join(', ') }}{% if r.interface.unmapped_apps %} (+other app(s)){% endif %}</td>
+              {% elif r.interface.status == 'no_mapping' %}
+              <td colspan="7">No interface mapping found ({{ r.interface.unmapped_apps|join(', ') }} not in matrix)</td>
+              {% else %}
+              <td colspan="7">Interface matrix not loaded</td>
+              {% endif %}
+              <td>{{ r.interface.contacts|join(', ') }}</td>
+              <td>{{ r.sample_error_text }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+    {% endif %}
+  </div>
+
+  <footer class="report-footer">
+    Source: {{ report.file_name }} · Generated {{ report.generated_at.strftime('%Y-%m-%d %H:%M') }} · Confidential — internal
+  </footer>
+
+  <script>
+    async function copyReportForEmail() {
+      const content = document.getElementById('export-content');
+      const feedback = document.getElementById('export-copy-feedback');
+      if (!content) return;
+      const html = content.outerHTML;
+      const text = content.innerText;
+      try {
+        await navigator.clipboard.write([
+          new ClipboardItem({
+            'text/html': new Blob([html], { type: 'text/html' }),
+            'text/plain': new Blob([text], { type: 'text/plain' }),
+          }),
+        ]);
+        feedback.textContent = 'Copied! Paste into Outlook or an email.';
+      } catch (e) {
+        try {
+          await navigator.clipboard.writeText(text);
+          feedback.textContent = 'Copied as plain text (rich copy unavailable here).';
+        } catch (e2) {
+          feedback.textContent = 'Copy failed — select the report manually.';
+        }
+      }
+      setTimeout(function () { feedback.textContent = ''; }, 4000);
+    }
+  </script>
+
+{% endif %}
+</body>
+</html>

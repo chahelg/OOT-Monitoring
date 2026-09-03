@@ -12,13 +12,13 @@
     {% include "_header.html" %}
 
     <div class="card toolbar-card">
-      <form method="get" action="{{ url_for('view') }}" class="toolbar-form">
-        <label for="file">File</label>
-        <select id="file" name="file" onchange="this.form.submit()">
-          {% for t in templates %}
-            <option value="{{ t.name }}" {% if t.name == selected_file %}selected{% endif %}>{{ t.name }}</option>
-          {% endfor %}
-        </select>
+      <form method="post" action="{{ url_for('view_open') }}" enctype="multipart/form-data"
+            class="toolbar-form" id="open-file-form">
+        <label for="file-browse">File</label>
+        <button type="button" class="btn" onclick="document.getElementById('file-browse').click()">Choose File…</button>
+        <input type="file" id="file-browse" name="file" accept=".xlsx" style="display:none"
+               onchange="if (this.files.length) document.getElementById('open-file-form').submit()">
+        <span class="current-filename" title="{{ selected_file }}">{{ selected_file or 'No file selected' }}</span>
         <input type="hidden" name="tab" value="{{ tab }}">
       </form>
 
@@ -29,6 +29,8 @@
            class="{{ 'active' if tab == 'excel_pivot' else '' }}">Pivot</a>
         <a href="{{ url_for('view', file=selected_file, tab='aging') }}"
            class="{{ 'active' if tab == 'aging' else '' }}">Aging{% if aging %} ({{ aging|selectattr('flagged')|list|length }} flagged){% endif %}</a>
+        <a href="{{ url_for('view', file=selected_file, tab='history') }}"
+           class="{{ 'active' if tab == 'history' else '' }}">History</a>
         <a href="{{ url_for('view', file=selected_file, tab='email_draft') }}"
            class="{{ 'active' if tab == 'email_draft' else '' }}">Email Draft</a>
       </div>
@@ -84,7 +86,8 @@
         {% if excel_pivot and excel_pivot.ok %}
           <div class="table-toolbar">
             <button type="button" class="btn btn-primary" id="excel-copy-btn"
-                    onclick="copyExcelPivot({{ selected_file|tojson }})">Copy (with Excel formatting)</button>
+                    data-file="{{ selected_file }}"
+                    onclick="copyExcelPivot(this.dataset.file)">Copy (with Excel formatting)</button>
             <span id="excel-copy-feedback" class="copy-feedback"></span>
           </div>
           <p class="muted-note">This button has Excel itself copy the range — colors, bold subtotal
@@ -105,53 +108,218 @@
         {% endif %}
       </div>
     {% elif tab == 'aging' %}
-      <div class="stat-tiles">
-        <div class="stat-tile stat-tile-critical">
-          <div class="stat-label">Flagged (&gt;48h)</div>
-          <div class="stat-value">{{ aging_stats.n_flagged }}</div>
+      {% macro queue_row(row, extra) %}
+      <tr class="queue-row queue-{{ row.priority|lower }}{{ ' queue-extra-row' if extra else '' }}"
+          data-priority="{{ row.priority }}" data-fi="{{ '1' if 'FI' in row.flags else '0' }}">
+        <td class="queue-priority-cell"><span class="priority-label priority-{{ row.priority|lower }}"
+              {% if row.priority_reasons %}title="{{ row.priority_reasons|join('; ') }}"{% endif %}>{{ row.priority }}</span></td>
+        <td class="nowrap">{{ row.stream }}</td>
+        <td class="queue-issue-cell cell-link" role="button" tabindex="0"
+            title="Click to read all alerts in this category"
+            data-file="{{ selected_file }}" data-category="{{ row.error_category }}"
+            onclick="openCategoryErrors(this.dataset.file, this.dataset.category)"
+            onkeydown="if(event.key==='Enter') this.click()">
+          <div class="queue-issue-name">{{ row.interface_name or row.error_category }}</div>
+          <div class="queue-issue-sub">{{ row.error_category }}{% if row.application %} · {{ row.application }}{% endif -%}
+            {%- if row.match_state in ('ambiguous', 'unmatched') %} <span class="match-tag">({{ row.match_state }} match)</span>{% endif -%}
+            {%- if row.enrichment_confidence != 'full' %} <span class="match-tag">({{ row.enrichment_confidence }} data)</span>{% endif -%}
+            {%- if row.priority_reasons %} <span class="match-tag">— {{ row.priority_reasons|join('; ') }}</span>{% endif %}</div>
+        </td>
+        <td class="tabular-nums dual-measure nowrap">
+          {% if row.docs_alerts_differ %}
+          <span class="dual-measure-primary">{{ row.distinct_objects }}</span><span class="dual-measure-unit">doc{{ 's' if row.distinct_objects != 1 else '' }}</span>
+          <span class="dual-measure-sep">·</span><span class="dual-measure-secondary">{{ row.alert_count }} alert{{ 's' if row.alert_count != 1 else '' }}</span>
+          {% else %}
+          <span class="dual-measure-primary">{{ row.alert_count }}</span><span class="dual-measure-unit">alert{{ 's' if row.alert_count != 1 else '' }}</span>
+          {% endif %}
+        </td>
+        <td class="tabular-nums nowrap">{{ row.age_label }}</td>
+        <td class="queue-trend nowrap">{{ row.sparkline_svg|safe }}<span class="trend-arrow">{{ row.trend_arrow }}</span></td>
+        <td class="queue-flags nowrap">{% for f in row.flags %}<span class="flag-glyph">{{ f }}</span>{% endfor %}</td>
+        <td>{{ row.owners|join(', ') if row.owners else '—' }}</td>
+      </tr>
+      {% endmacro %}
+
+      <div class="card verdict-card">
+        <a class="btn-link export-report-link" style="float:right;"
+           href="{{ url_for('export_health_report', file=selected_file, mode='full') }}">Export report ↗</a>
+        {% if not report.interface_matrix_available %}
+        <div class="matrix-banner">
+          <strong>Interface matrix not loaded.</strong> Criticality, ownership, and interface names below
+          are unavailable and shown as "Unknown" / "Unmapped" — counts and priorities are still correct.
+          Copy <code>Oxygen_Interface_Matrix_w1.xlsx</code> into <code>Excel File Generator/reference/</code>
+          to enable them.
         </div>
-        <div class="stat-tile stat-tile-warning">
-          <div class="stat-label">New spikes</div>
-          <div class="stat-value">{{ aging_stats.n_spikes }}</div>
-        </div>
-        <div class="stat-tile">
-          <div class="stat-label">Open alerts (flagged)</div>
-          <div class="stat-value">{{ aging_stats.flagged_total }}</div>
-        </div>
-        <div class="stat-tile">
-          <div class="stat-label">Oldest issue</div>
-          <div class="stat-value">{{ aging_stats.oldest_days }}<span class="stat-unit">d</span></div>
+        {% endif %}
+        <p class="verdict-sentence">{{ report.verdict }}</p>
+        <div class="headline-grid">
+          <button type="button" class="stat-tile headline-tile headline-clickable {{ 'headline-critical' if report.headline.p1_open else '' }}"
+                  onclick="filterQueue('p1', this)" title="Click to filter the priority queue below to P1 only">
+            <div class="stat-label">P1 open</div>
+            <div class="stat-value tabular-nums">{{ report.headline.p1_open }}</div>
+          </button>
+          <div class="stat-tile headline-tile">
+            <div class="stat-label">Documents stuck</div>
+            <div class="stat-value tabular-nums">{{ report.headline.docs_stuck }}</div>
+          </div>
+          <button type="button" class="stat-tile headline-tile headline-clickable" onclick="filterQueue('fi', this)"
+                  title="Click to filter the priority queue below to FI-impacting issues only">
+            <div class="stat-label">FI-impacting</div>
+            <div class="stat-value tabular-nums">{{ report.headline.fi_impacting }}</div>
+          </button>
+          <div class="stat-tile headline-tile">
+            <div class="stat-label">Streams at risk</div>
+            <div class="stat-value tabular-nums">{{ report.headline.streams_at_risk }}</div>
+          </div>
+          <div class="stat-tile headline-tile">
+            <div class="stat-label">Oldest issue</div>
+            <div class="stat-value tabular-nums">{{ report.headline.oldest_days|round(1) }}<span class="stat-unit">d</span></div>
+          </div>
+          <div class="stat-tile headline-tile">
+            <div class="stat-label">Net vs. yesterday</div>
+            <div class="stat-value tabular-nums">{{ '+' if report.headline.net_vs_yesterday > 0 else '' }}{{ report.headline.net_vs_yesterday }}</div>
+          </div>
         </div>
       </div>
 
       <div class="card">
         <div class="chart-header">
-          <h3>Top categories by open count</h3>
+          <h3>Priority queue <span class="muted-inline">({{ report.queue_total }} issue{{ 's' if report.queue_total != 1 else '' }})</span></h3>
           <div class="legend">
-            <span class="legend-item"><span class="legend-swatch legend-critical"></span>Stale (&gt;48h, not clearing)</span>
-            <span class="legend-item"><span class="legend-swatch legend-warning"></span>New spike (young, concentrated today)</span>
-            <span class="legend-item"><span class="legend-swatch legend-ok"></span>OK</span>
+            <span class="legend-item"><span class="flag-glyph">FI</span>Financial posting impact</span>
+            <span class="legend-item"><span class="flag-glyph">Stock</span>Stock movement</span>
+            <span class="legend-item"><span class="flag-glyph">Time-critical</span>Time-critical</span>
           </div>
         </div>
-        <div class="hbar-chart">
-          {% for r in aging_stats.top %}
-          <div class="hbar-row">
-            <div class="hbar-label" title="{{ r.alert_type }}">{{ r.alert_type }}</div>
-            <div class="hbar-track">
-              <div class="hbar-fill {{ 'hbar-critical' if r.flagged else ('hbar-warning' if r.is_new_spike else 'hbar-ok') }}"
-                   style="width: {{ (r.count / aging_stats.max_count * 100)|round(1) }}%"></div>
-            </div>
-            <div class="hbar-value">{{ r.count }}</div>
-          </div>
-          {% endfor %}
+        <p class="muted-note">Sorted by weighted score (criticality, FI impact, age, blast radius, volume,
+          trend) — not raw alert count, so a large retry storm on a few documents doesn't automatically
+          outrank a smaller, higher-stakes issue. Click any row to read its raw alerts.</p>
+        <div class="table-scroll">
+          <table id="queue-table">
+            <thead>
+              <tr>
+                <th>Priority</th><th>Stream</th><th>Issue</th><th>Documents / Alerts</th>
+                <th>Age</th><th>7-day trend</th><th>Flags</th><th>Owners</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in report.queue_default %}{{ queue_row(row, false) }}{% endfor %}
+              {% for row in report.queue_extra %}{{ queue_row(row, true) }}{% endfor %}
+            </tbody>
+          </table>
         </div>
+        {% if report.queue_extra %}
+        <button type="button" class="btn btn-link show-more-btn" style="margin-top:10px;"
+                data-extra-count="{{ report.queue_extra|length }}" onclick="toggleQueueExtra(this)">
+          Show {{ report.queue_extra|length }} more</button>
+        {% endif %}
       </div>
 
       <div class="card">
-        <p class="muted-note">Alert types grouped across the whole file, flagged if the earliest
-          occurrence of that category is more than 48 hours old — i.e. it's still showing up in
-          today's export past the expected resolution window. Sorted worst (oldest) first, then by
-          count.</p>
+        <h3 class="band-title">Ownership</h3>
+        <div class="table-scroll">
+          <table id="ownership-table">
+            <thead>
+              <tr>
+                <th>Stream</th><th>P1</th><th>Open issues</th><th>Documents / Alerts</th>
+                <th>Oldest</th><th>Age distribution</th><th>Contacts</th><th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in report.ownership %}
+              <tr>
+                <td class="nowrap">{{ row.stream }}</td>
+                <td class="tabular-nums">{{ row.p1_count }}</td>
+                <td class="tabular-nums">{{ row.open_count }}</td>
+                <td class="tabular-nums dual-measure nowrap">
+                  {% if row.docs_alerts_differ %}
+                  <span class="dual-measure-primary">{{ row.distinct_objects }}</span><span class="dual-measure-unit">docs</span>
+                  <span class="dual-measure-sep">·</span><span class="dual-measure-secondary">{{ row.alert_count }} alerts</span>
+                  {% else %}
+                  <span class="dual-measure-primary">{{ row.alert_count }}</span><span class="dual-measure-unit">alerts</span>
+                  {% endif %}
+                </td>
+                <td class="tabular-nums nowrap">{{ row.oldest_days|round(1) }}d</td>
+                <td class="aging-bar-cell">
+                  <div class="aging-bar" title="&lt;24h: {{ row.aging_buckets['<24h'] }} · 1-2d: {{ row.aging_buckets['1-2d'] }} · 3-7d: {{ row.aging_buckets['3-7d'] }} · &gt;7d: {{ row.aging_buckets['>7d'] }}">
+                    <span class="aging-seg aging-seg-1" style="flex-grow:{{ row.aging_buckets['<24h'] }}"></span>
+                    <span class="aging-seg aging-seg-2" style="flex-grow:{{ row.aging_buckets['1-2d'] }}"></span>
+                    <span class="aging-seg aging-seg-3" style="flex-grow:{{ row.aging_buckets['3-7d'] }}"></span>
+                    <span class="aging-seg aging-seg-4" style="flex-grow:{{ row.aging_buckets['>7d'] }}"></span>
+                  </div>
+                </td>
+                <td>{{ row.contacts|join(', ') if row.contacts else '—' }}</td>
+                <td class="nowrap">{% if row.escalate %}<span class="status-badge status-badge-fail">ESCALATE</span>{% endif %}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        <p class="muted-note" style="margin:10px 0 0;">Age distribution: lightest = under 24h, darkest = over 7 days old.</p>
+      </div>
+
+      {% macro movement_item(m, date_kind) %}
+      <li>
+        <div class="movement-item-title">
+          <span class="priority-label priority-{{ m.priority|lower }}">{{ m.priority }}</span>
+          [{{ m.stream }}] {{ m.interface_name or m.error_category }}
+        </div>
+        <div class="movement-item-sub">
+          {% if m.docs_alerts_differ %}{{ m.distinct_objects }} doc{{ 's' if m.distinct_objects != 1 else '' }} · {{ m.alert_count }} alert{{ 's' if m.alert_count != 1 else '' }}
+          {%- else %}{{ m.alert_count }} alert{{ 's' if m.alert_count != 1 else '' }}{% endif -%}
+          {%- if date_kind == 'first' %} · first seen {{ m.first_seen_label }}
+          {%- else %} · last seen {{ m.last_seen_label }}{% endif %}
+        </div>
+      </li>
+      {% endmacro %}
+
+      <div class="card">
+        <h3 class="band-title">Movement <span class="muted-inline">— 14-day distinct documents affected</span></h3>
+        {% if report.movement.series_svg %}
+        <div class="movement-chart-wrap">{{ report.movement.series_svg|safe }}</div>
+        <div class="movement-chart-labels"><span>{{ report.movement.series_start_label }}</span><span>{{ report.movement.series_end_label }}</span></div>
+        {% else %}
+        <p class="muted-note">No multi-day history available yet.</p>
+        {% endif %}
+        <div class="movement-columns">
+          <div class="movement-col">
+            <h4>Cleared since yesterday <span class="muted-inline">({{ report.movement.cleared|length }})</span></h4>
+            <p class="muted-note" style="margin:0 0 8px;">Was generating alerts yesterday, silent on the latest day — volume shown is what it was producing before it cleared.</p>
+            {% if report.movement.cleared %}
+            <ul class="movement-list">{% for m in report.movement.cleared %}{{ movement_item(m, 'last') }}{% endfor %}</ul>
+            {% else %}<p class="muted-note">None.</p>{% endif %}
+          </div>
+          <div class="movement-col">
+            <h4>New today <span class="muted-inline">({{ report.movement.new_today|length }})</span></h4>
+            {% if report.movement.new_today %}
+            <ul class="movement-list">{% for m in report.movement.new_today %}{{ movement_item(m, 'first') }}{% endfor %}</ul>
+            {% else %}<p class="muted-note">None.</p>{% endif %}
+          </div>
+          <div class="movement-col">
+            <h4>Recurring <span class="muted-inline">({{ report.movement.recurring|length }})</span></h4>
+            {% if report.movement.recurring %}
+            <ul class="movement-list">{% for m in report.movement.recurring %}{{ movement_item(m, 'last') }}{% endfor %}</ul>
+            {% else %}<p class="muted-note">None.</p>{% endif %}
+          </div>
+        </div>
+      </div>
+
+      {% if interface_matrix_missing %}
+      <div class="card">
+        <p class="muted-note" style="margin:0;">Interface matrix reference file not found — channels
+          and the Stream / Interface / Contact columns below are unavailable. Copy
+          <code>Oxygen_Interface_Matrix_w1.xlsx</code> into <code>Excel File Generator/reference/</code>
+          to enable them.</p>
+      </div>
+      {% endif %}
+
+      <details class="card">
+        <summary style="cursor:pointer; font-weight:700; font-size:14px;">Full detail table (every
+          category, every column — for copy/paste into an email)</summary>
+        <p class="muted-note" style="margin-top:12px;">Alert types grouped across the whole file,
+          flagged if the earliest occurrence of that category is more than 48 hours old — i.e. it's
+          still showing up in today's export past the expected resolution window. Sorted worst
+          (oldest) first, then by count.</p>
         <div class="table-toolbar">
           <button type="button" class="btn" onclick="copyTable('aging-table')">Copy table</button>
           <span id="copy-feedback" class="copy-feedback"></span>
@@ -162,6 +330,8 @@
               <tr>
                 <th>Status</th><th>Alert type</th><th>alert grouping</th><th>Count</th>
                 <th>First seen</th><th>Age (days)</th><th>Pattern</th>
+                <th>Stream</th><th>Interface Name</th><th>Middleware</th><th>S4 Tech</th>
+                <th>Mode</th><th>Direction</th><th>Datadog App</th><th>Contact</th><th>Sample error</th>
               </tr>
             </thead>
             <tbody>
@@ -170,18 +340,147 @@
                 <td>{% if r.flagged %}<span class="status-badge status-badge-fail">STALE</span>
                     {% elif r.is_new_spike %}<span class="status-badge status-badge-warn">NEW SPIKE</span>
                     {% else %}<span class="status-badge status-badge-ok">OK</span>{% endif %}</td>
-                <td>{{ r.alert_type }}</td>
+                <td class="cell-link" title="Click to read all errors in this category"
+                    data-file="{{ selected_file }}" data-category="{{ r.alert_type }}"
+                    onclick="openCategoryErrors(this.dataset.file, this.dataset.category)">{{ r.alert_type }}</td>
                 <td>{{ r.grouping }}</td>
                 <td>{{ r.count }}</td>
                 <td class="nowrap">{{ r.earliest.strftime('%Y-%m-%d') }}</td>
                 <td>{{ r.age_days }}</td>
                 <td>{{ 'Recurring' if r.is_recurring else ('New spike' if r.is_new_spike else '') }}</td>
+                {% if r.interface.status == 'resolved' %}
+                <td>{{ r.interface.row.stream }}</td>
+                <td>{{ r.interface.row.interface_name }}{% if r.interface.spans_multiple %}
+                  <span class="muted-note" style="margin: 0;"
+                        title="This category spans {{ r.interface.distinct_count }} distinct interfaces — showing the most common one.">
+                    (+{{ r.interface.distinct_count - 1 }} more)</span>{% endif %}</td>
+                <td>{{ r.interface.row.middleware }}</td>
+                <td>{{ r.interface.row.s4_integration_tech }}</td>
+                <td>{{ r.interface.row.interface_mode }}</td>
+                <td>{{ r.interface.row.message_direction }}</td>
+                <td>{{ r.interface.app_names|join(', ') }}
+                    {%- if r.interface.unmapped_apps %} <span class="status-badge status-badge-ok"
+                      title="Also seen from: {{ r.interface.unmapped_apps|join(', ') }} (not in the interface matrix)">+other app(s)</span>{% endif %}</td>
+                {% elif r.interface.status == 'no_mapping' %}
+                <td colspan="7"><span class="status-badge status-badge-ok">No interface mapping found</span>
+                  ({{ r.interface.unmapped_apps|join(', ') }} not in matrix)</td>
+                {% else %}
+                <td colspan="7"><span class="status-badge status-badge-ok">Interface matrix not loaded</span></td>
+                {% endif %}
+                <td>{{ r.interface.contacts|join(', ') }}</td>
+                <td class="truncate" onclick="toggleCellExpand(this)" title="Click to expand">{{ r.sample_error_text }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </details>
+    {% elif tab == 'history' %}
+      {% if not history_report.has_data %}
+      <div class="card">
+        <p class="muted-note" style="margin:0;">No historical daily files found yet in <code>output/</code> —
+          generate at least one workbook (named the normal way, e.g. "active-alert category 19 Aug.xlsx")
+          to start building history.</p>
+      </div>
+      {% else %}
+      <div class="card verdict-card">
+        {% if not history_report.interface_matrix_available %}
+        <div class="matrix-banner">
+          <strong>Interface matrix not loaded.</strong> The "By stream" breakdown below is unavailable
+          and shown as "Unavailable" — the file list and daily totals are still correct.
+        </div>
+        {% endif %}
+        <h3 class="band-title" style="margin-bottom:4px;">History</h3>
+        <p class="muted-note">{{ history_report.total_events }} distinct alert events across
+          {{ history_report.files|length }} daily file{{ 's' if history_report.files|length != 1 else '' }},
+          {{ history_report.earliest_date.strftime('%Y-%m-%d') }} to {{ history_report.latest_date.strftime('%Y-%m-%d') }}.
+          {{ history_report.total_raw_rows }} raw rows were read in total —
+          {{ history_report.total_raw_rows - history_report.total_events }} were re-exports of the same real
+          event across overlapping daily files, correctly not double-counted.</p>
+        <div class="headline-grid" style="grid-template-columns: repeat(3, 1fr);">
+          {% for w in history_report.windows %}
+          <div class="stat-tile">
+            <div class="stat-label">Last {{ w.days }} days</div>
+            <div class="stat-value tabular-nums">{{ w.alerts }}<span class="stat-unit"> alert{{ 's' if w.alerts != 1 else '' }}</span></div>
+            {% if w.docs_alerts_differ %}<div class="muted-inline">{{ w.distinct_objects }} distinct documents</div>{% endif %}
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+
+      <div class="card">
+        <h3 class="band-title" style="margin-bottom:4px;">Search error history</h3>
+        <p class="muted-note">Find every day a specific error fired, or look up which error(s) a business
+          object key appeared under. Matches error/alert messages, error details, business object key,
+          application, service, and transaction URL — across the full multi-day history above, not just
+          one file.</p>
+        <div class="table-toolbar">
+          <input type="text" id="history-search-input" style="flex:1; margin:0;"
+                 placeholder="e.g. &quot;gateway timeout&quot; or a business object key"
+                 onkeydown="if (event.key === 'Enter') { event.preventDefault(); runHistorySearch(); }">
+          <button type="button" class="btn btn-primary" style="margin:0;" onclick="runHistorySearch()">Search</button>
+          <span id="history-search-feedback" class="copy-feedback"></span>
+        </div>
+        <div id="history-search-results"></div>
+      </div>
+
+      <div class="card">
+        <div class="chart-header">
+          <h3 class="band-title" style="margin:0;">Daily volume <span class="muted-inline">— full history, {{ history_report.daily_series_start_label }} to {{ history_report.daily_series_end_label }}</span></h3>
+          <div class="legend">
+            <span class="legend-item"><span class="legend-swatch" style="background:#b7c0cf;"></span>Alerts</span>
+            <span class="legend-item"><span class="legend-swatch" style="background:var(--primary); border-radius:50%;"></span>Distinct documents</span>
+          </div>
+        </div>
+        <div class="hist-chart-wrap" id="daily-volume-chart">
+          {{ history_report.daily_chart_svg|safe }}
+          <div class="hist-tooltip" id="hist-tooltip" style="display:none;"></div>
+        </div>
+        <p class="muted-note" style="margin:10px 0 0;">Hover (or tap) a bar for the exact date, alert count, and
+          distinct documents affected.</p>
+      </div>
+
+      <div class="card">
+        <h3 class="band-title">By stream <span class="muted-inline">— last {{ history_report.stream_window_days }} days</span></h3>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>Stream</th><th>Alerts</th><th>Trend</th></tr></thead>
+            <tbody>
+              {% for s in history_report.streams %}
+              <tr>
+                <td class="nowrap">{{ s.stream }}</td>
+                <td class="tabular-nums">{{ s.total_alerts }}</td>
+                <td class="nowrap">{{ s.sparkline_svg|safe }}<span class="trend-arrow">{{ s.trend_arrow }}</span></td>
               </tr>
               {% endfor %}
             </tbody>
           </table>
         </div>
       </div>
+
+      <details class="card">
+        <summary style="cursor:pointer; font-weight:700; font-size:14px;">Files ingested ({{ history_report.files|length }})</summary>
+        <p class="muted-note" style="margin-top:12px;">Every canonical daily export found in <code>output/</code>
+          (test/trial/renamed files are excluded — see history.py). Each file is a rolling multi-day window, so
+          "rows in file" is that file's own raw row count, not an additive contribution to the total above.</p>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>File</th><th>Date</th><th>Rows in file</th><th></th></tr></thead>
+            <tbody>
+              {% for f in history_report.files %}
+              <tr>
+                <td>{{ f.name }}</td>
+                <td class="nowrap">{{ f.file_date_label }}</td>
+                <td class="tabular-nums">{{ f.event_count }}</td>
+                <td>{% if f.date_mismatch %}<span class="match-tag"
+                    title="The filename's date and the data's own latest timestamp disagree — the data's date is trusted.">date mismatch</span>{% endif %}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </details>
+      {% endif %}
     {% elif tab == 'email_draft' %}
       <div class="card">
         <p class="muted-note">Auto-generated draft — review and edit before sending. The
@@ -218,9 +517,79 @@
                   placeholder='Click &quot;Generate with local LLM&quot; above. This runs a language model entirely on this PC (no GPU here), so it can take several minutes — that&#39;s normal.'></textarea>
       </div>
     {% endif %}
+
+    {# Shared alert-detail drill-down modal — used by the Aging tab's
+       "view errors" (openCategoryErrors) and the History tab's error
+       search (openHistoryErrorDetails). Kept outside every tab-specific
+       branch above, since either tab can be the one requesting it. #}
+    <div id="error-modal-overlay" class="modal-overlay" style="display:none;"
+         onclick="if (event.target === this) closeCategoryErrors()">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h3 id="error-modal-title">Errors</h3>
+          <button type="button" class="modal-close" onclick="closeCategoryErrors()" aria-label="Close">&times;</button>
+        </div>
+        <div id="error-modal-body" class="modal-body">
+          <p class="muted-note">Loading…</p>
+        </div>
+      </div>
+    </div>
   </div>
 
   <script>
+    (function () {
+      // History tab's daily-volume chart hover tooltip — a no-op on
+      // every other tab, since #daily-volume-chart only exists when
+      // tab=history is rendered.
+      const wrap = document.getElementById('daily-volume-chart');
+      if (!wrap) return;
+      const tooltip = document.getElementById('hist-tooltip');
+      wrap.addEventListener('mousemove', function (e) {
+        const bar = e.target.closest('.hist-bar');
+        if (!bar) {
+          tooltip.style.display = 'none';
+          return;
+        }
+        tooltip.style.display = 'block';
+        tooltip.textContent = bar.dataset.date + ' — ' + bar.dataset.alerts + ' alert' +
+          (bar.dataset.alerts === '1' ? '' : 's') + ', ' + bar.dataset.docs + ' distinct document' +
+          (bar.dataset.docs === '1' ? '' : 's');
+        const rect = wrap.getBoundingClientRect();
+        let left = e.clientX - rect.left + 12;
+        left = Math.min(left, rect.width - 180);
+        tooltip.style.left = Math.max(left, 0) + 'px';
+        tooltip.style.top = (e.clientY - rect.top - 30) + 'px';
+      });
+      wrap.addEventListener('mouseleave', function () {
+        tooltip.style.display = 'none';
+      });
+    })();
+
+    function toggleQueueExtra(btn) {
+      const table = document.getElementById('queue-table');
+      if (!table) return;
+      const showingAll = table.classList.toggle('showing-all');
+      btn.textContent = showingAll ? 'Show fewer' : ('Show ' + btn.dataset.extraCount + ' more');
+    }
+
+    function filterQueue(kind, tile) {
+      const table = document.getElementById('queue-table');
+      if (!table) return;
+      const alreadyActive = tile.classList.contains('active');
+      document.querySelectorAll('.headline-tile.headline-clickable, .headline-tile.active')
+        .forEach(function (t) { t.classList.remove('active'); });
+      const rows = table.querySelectorAll('tbody tr');
+      if (alreadyActive) {
+        rows.forEach(function (r) { r.classList.remove('queue-row-hidden'); });
+        return;
+      }
+      tile.classList.add('active');
+      rows.forEach(function (r) {
+        const show = kind === 'p1' ? r.dataset.priority === 'P1' : r.dataset.fi === '1';
+        r.classList.toggle('queue-row-hidden', !show);
+      });
+    }
+
     function toggleCellExpand(cell) {
       cell.classList.toggle('cell-expanded');
     }
@@ -280,6 +649,150 @@
       } finally {
         btn.disabled = false;
         btn.textContent = originalText;
+      }
+    }
+
+    const ERROR_MODAL_COLUMNS = [
+      ['timestamp', 'Timestamp'], ['grouping', 'Grouping'], ['service', 'Service'],
+      ['application_name', 'Application'], ['business_object_key', 'Business Object Key'],
+      ['sequence', 'Sequence'], ['transaction_url', 'Transaction URL'],
+      ['alert_message', 'Alert Message'], ['error_message', 'Error Message'], ['error_details', 'Error Details'],
+    ];
+
+    function renderErrorModalRows(rows) {
+      let html = '<div class="table-toolbar">'
+        + '<button type="button" class="btn" onclick="copyTable(\'error-modal-table\')">Copy table</button>'
+        + '<span id="error-modal-copy-feedback" class="copy-feedback"></span></div>'
+        + '<div class="table-scroll"><table id="error-modal-table" class="wide-table"><thead><tr>';
+      for (const [, label] of ERROR_MODAL_COLUMNS) html += '<th>' + label + '</th>';
+      html += '</tr></thead><tbody>';
+      for (const row of rows) {
+        html += '<tr>';
+        for (const [key] of ERROR_MODAL_COLUMNS) html += '<td>' + escapeHtml(row[key]) + '</td>';
+        html += '</tr>';
+      }
+      html += '</tbody></table></div>';
+      return html;
+    }
+
+    // Shared by openCategoryErrors (Aging tab, one file) and
+    // openHistoryErrorDetails (History tab, full multi-day history) —
+    // same modal, same response shape (see webapp.py's
+    // _serialize_alert_row), just a different fetch behind it.
+    async function openErrorModal(titleText, fetchUrl, fetchParams) {
+      const overlay = document.getElementById('error-modal-overlay');
+      const title = document.getElementById('error-modal-title');
+      const body = document.getElementById('error-modal-body');
+      title.textContent = titleText;
+      body.innerHTML = '<p class="muted-note">Loading…</p>';
+      overlay.style.display = 'flex';
+      try {
+        const resp = await fetch(fetchUrl, { method: 'POST', body: new URLSearchParams(fetchParams) });
+        const data = await resp.json();
+        if (!data.ok) {
+          body.innerHTML = '<p class="muted-note">Failed to load: ' + escapeHtml(data.error || 'unknown error') + '</p>';
+          return;
+        }
+        title.textContent = titleText + ' — ' + data.count + ' alert' + (data.count === 1 ? '' : 's');
+        if (data.rows.length === 0) {
+          body.innerHTML = '<p class="muted-note">No rows found.</p>';
+          return;
+        }
+        body.innerHTML = renderErrorModalRows(data.rows);
+      } catch (e) {
+        body.innerHTML = '<p class="muted-note">Failed to load: ' + escapeHtml(String(e)) + '</p>';
+      }
+    }
+
+    function openCategoryErrors(filename, category) {
+      return openErrorModal(category, '/view/category-errors', { file: filename, category: category });
+    }
+
+    // stream/application/category identify the search result's issue
+    // group exactly the way severity.group_issues() grouped it — see
+    // report_model.history_error_details().
+    function openHistoryErrorDetails(stream, application, category) {
+      return openErrorModal(category, '/view/history-error-details',
+        { stream: stream, application: application, error_category: category });
+    }
+
+    function closeCategoryErrors() {
+      const overlay = document.getElementById('error-modal-overlay');
+      if (overlay) overlay.style.display = 'none';
+    }
+
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape') closeCategoryErrors();
+    });
+
+    function escapeHtml(s) {
+      const div = document.createElement('div');
+      div.textContent = s == null ? '' : String(s);
+      return div.innerHTML;
+    }
+
+    // History tab's error search — a no-op on every other tab, since
+    // #history-search-input only exists when tab=history is rendered.
+    async function runHistorySearch() {
+      const input = document.getElementById('history-search-input');
+      const results = document.getElementById('history-search-results');
+      const feedback = document.getElementById('history-search-feedback');
+      if (!input || !results) return;
+      const query = input.value.trim();
+      if (!query) {
+        results.innerHTML = '';
+        feedback.textContent = '';
+        return;
+      }
+      feedback.textContent = 'Searching…';
+      results.innerHTML = '';
+      try {
+        const resp = await fetch('/view/history-search', {
+          method: 'POST',
+          body: new URLSearchParams({ query: query }),
+        });
+        const data = await resp.json();
+        if (!data.ok) {
+          feedback.textContent = '';
+          results.innerHTML = '<p class="muted-note">Search failed: ' + escapeHtml(data.error || 'unknown error') + '</p>';
+          return;
+        }
+        feedback.textContent = '';
+        if (data.results.length === 0) {
+          results.innerHTML = '<p class="muted-note">No matches for "' + escapeHtml(query) + '" — try a shorter snippet '
+            + 'of the error message, or a business object key.</p>';
+          return;
+        }
+        let html = '<p class="muted-note">' + data.results.length + ' matching error categor'
+          + (data.results.length === 1 ? 'y' : 'ies') + ' for "' + escapeHtml(query) + '":</p>'
+          + '<div class="table-scroll"><table><thead><tr>'
+          + '<th>Stream</th><th>Error category</th><th>Alerts</th><th>Distinct objects</th>'
+          + '<th>Days active</th><th>First seen</th><th>Last seen</th><th></th>'
+          + '</tr></thead><tbody>';
+        for (const r of data.results) {
+          const matchNote = r.match_kind === 'detail'
+            ? ' <span class="match-tag" title="Matched a detail field (e.g. business object key) in at least one alert, not the error name itself">(matched in details)</span>'
+            : '';
+          html += '<tr>'
+            + '<td class="nowrap">' + escapeHtml(r.stream) + '</td>'
+            + '<td class="cell-link" role="button" tabindex="0" title="Click to see every occurrence"'
+            + ' data-stream="' + escapeHtml(r.stream) + '" data-application="' + escapeHtml(r.application) + '"'
+            + ' data-category="' + escapeHtml(r.error_category) + '"'
+            + ' onclick="openHistoryErrorDetails(this.dataset.stream, this.dataset.application, this.dataset.category)"'
+            + ' onkeydown="if(event.key===\'Enter\') this.click()">' + escapeHtml(r.error_category) + matchNote + '</td>'
+            + '<td class="tabular-nums">' + r.alert_count + '</td>'
+            + '<td class="tabular-nums">' + r.distinct_objects + '</td>'
+            + '<td class="tabular-nums">' + r.days_active + '</td>'
+            + '<td class="nowrap">' + escapeHtml(r.first_seen_label) + '</td>'
+            + '<td class="nowrap">' + escapeHtml(r.last_seen_label) + '</td>'
+            + '<td class="nowrap">' + r.sparkline_svg + '</td>'
+            + '</tr>';
+        }
+        html += '</tbody></table></div>';
+        results.innerHTML = html;
+      } catch (e) {
+        feedback.textContent = '';
+        results.innerHTML = '<p class="muted-note">Search failed: ' + escapeHtml(String(e)) + '</p>';
       }
     }
 

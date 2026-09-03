@@ -1,9 +1,28 @@
 # Generated workbooks — real daily output, never checked in
 output/
 
+# history.py's cache of every daily workbook's extracted events — the
+# one deliberate exception to "recompute from disk every time" (reading
+# weeks of .xlsx on every page load is too slow for a live page). Purely
+# a cache, never a second source of truth: deleting it just costs one
+# slow rebuild on the next request, so it's fine to leave un-tracked.
+# Already covered by output/ above; listed explicitly so it stays
+# excluded even if that broader rule ever narrows.
+output/.history_index.json
+
+# Same as above, for the History tab's separate index — it reads from
+# the user's own daily archive folders (one per day, next to this
+# app's own folder) rather than output/, but still caches into
+# output/ for consistency with the entry above.
+output/.history_daily_folders_index.json
+
 # The reference/template workbook used to seed a day's Match sheet —
 # contains real historical alert data, not code
 Copy of Copy of active-alert category 3 Aug.xlsx
+
+# Interface matrix reference file(s) — contains real employee names and
+# email addresses, not code (same reasoning as the entry above)
+reference/
 
 # Python
 __pycache__/

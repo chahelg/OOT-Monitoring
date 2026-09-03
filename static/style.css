@@ -364,6 +364,24 @@ footer {
   min-width: 260px;
 }
 
+.toolbar-form .btn {
+  margin-top: 0;
+}
+
+.toolbar-form .current-filename {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text);
+  padding: 9px 12px;
+  background: #f4f6fa;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  max-width: 360px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .tab-toggle {
   display: flex;
   gap: 6px;
@@ -674,6 +692,552 @@ tr.aging-flagged:hover {
 @media (max-width: 720px) {
   .hbar-row { grid-template-columns: 130px 1fr 36px; }
   .hbar-label { font-size: 11.5px; }
+}
+
+/* Aging dashboard: per-stream channel cards */
+.channels-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 14px;
+  margin-bottom: 22px;
+}
+
+.channel-card {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--channel-accent, var(--border));
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 16px 18px;
+  display: flex;
+  flex-direction: column;
+}
+
+.channel-card-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 4px;
+}
+
+.channel-name {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.channel-total {
+  font-size: 12px;
+  color: var(--muted);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.channel-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.channel-contact {
+  font-size: 12px;
+  color: var(--muted);
+  padding-bottom: 12px;
+  margin-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.channel-categories {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  /* Every category for this channel renders — nothing is capped or
+     hidden behind a "+N more" link — but a channel having dozens of
+     categories shouldn't stretch the whole page; past this height the
+     list scrolls internally instead. */
+  max-height: 420px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.channel-cat-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  border-radius: 6px;
+  margin: -3px -6px;
+  padding: 3px 6px;
+}
+
+.channel-cat-row:hover, .channel-cat-row:focus-visible {
+  background: var(--bg);
+  outline: none;
+}
+
+.channel-cat-row:hover .channel-cat-name {
+  color: var(--primary);
+}
+
+.cell-link {
+  cursor: pointer;
+  color: var(--primary);
+  text-decoration: underline;
+  text-decoration-color: transparent;
+}
+
+.cell-link:hover {
+  text-decoration-color: currentColor;
+}
+
+.channel-cat-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 12.5px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.channel-cat-count {
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--text);
+  flex-shrink: 0;
+}
+
+.channel-cat-tech {
+  font-size: 11px;
+  color: var(--muted);
+  margin: -5px 0 0 26px;
+}
+
+/* Category error drill-down modal */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(20, 30, 60, 0.45);
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.modal-content {
+  background: var(--card-bg);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 40px rgba(20, 30, 60, 0.3);
+  width: 100%;
+  max-width: 1100px;
+  max-height: calc(100vh - 48px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 18px 22px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.modal-header h3 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text);
+  overflow-wrap: break-word;
+}
+
+.modal-close {
+  background: none;
+  border: none;
+  font-size: 22px;
+  line-height: 1;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 4px 8px;
+  flex-shrink: 0;
+  border-radius: 6px;
+}
+
+.modal-close:hover {
+  background: var(--bg);
+  color: var(--text);
+}
+
+.modal-body {
+  padding: 18px 22px 22px;
+  overflow-y: auto;
+}
+
+/* Deliberately the opposite of .truncate: full text, wrapped rather
+   than cut off — the whole point of this table is to actually read
+   the error, not preview it. */
+.wide-table td, .wide-table th {
+  white-space: normal;
+  word-break: break-word;
+  vertical-align: top;
+  max-width: 320px;
+}
+
+/* --------------------------------------------------------------------
+   Integration Health Report (Aging tab, Bands 1-5) — additive tokens
+   only, nothing above is replaced. Color is reserved for severity
+   (P1 = --fail, P2 = --warn, P3 = neutral grey) everywhere in this
+   section; the aging-distribution bar uses a separate sequential
+   grey ramp (light -> dark) rather than the severity colors, since it
+   answers a different question ("how old") and reusing red/amber
+   there would make it look like a second, conflicting severity signal.
+-------------------------------------------------------------------- */
+:root {
+  --priority-p1: var(--fail);
+  --priority-p2: var(--warn);
+  --priority-p3: var(--muted);
+
+  --aging-1: #e4e7ee;
+  --aging-2: #b7c0cf;
+  --aging-3: #7c8798;
+  --aging-4: #3a4250;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; }
+}
+
+.tabular-nums { font-variant-numeric: tabular-nums; }
+
+.band-title {
+  margin: 0 0 14px;
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.muted-inline {
+  color: var(--muted);
+  font-weight: 500;
+  font-size: 12px;
+}
+
+.matrix-banner {
+  background: #fff8e6;
+  border: 1px solid #f0d99a;
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-size: 12.5px;
+  color: var(--text);
+  margin-bottom: 16px;
+}
+
+.verdict-sentence {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text);
+  margin: 0 0 18px;
+}
+
+.headline-grid {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 14px;
+}
+
+@media (max-width: 900px) {
+  .headline-grid { grid-template-columns: repeat(3, 1fr); }
+}
+
+.headline-tile {
+  display: block;
+  width: 100%;
+  text-align: left;
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+  margin: 0;
+  cursor: default;
+}
+
+.headline-clickable {
+  cursor: pointer;
+}
+
+.headline-clickable:hover {
+  border-color: var(--primary);
+}
+
+.headline-clickable:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+.headline-clickable.active {
+  border-color: var(--primary);
+  box-shadow: var(--shadow), inset 0 0 0 1px var(--primary);
+}
+
+.headline-critical {
+  border-top-color: var(--priority-p1);
+}
+
+/* Priority queue */
+.priority-label {
+  font-weight: 700;
+  font-size: 12.5px;
+  letter-spacing: 0.02em;
+}
+
+.priority-p1 { color: var(--priority-p1); }
+.priority-p2 { color: var(--priority-p2); }
+.priority-p3 { color: var(--priority-p3); }
+
+#queue-table td:first-child {
+  border-left: 3px solid transparent;
+}
+
+.queue-row.queue-p1 td:first-child { border-left-color: var(--priority-p1); }
+.queue-row.queue-p2 td:first-child { border-left-color: var(--priority-p2); }
+.queue-row.queue-p3 td:first-child { border-left-color: var(--border); }
+
+.queue-issue-cell {
+  cursor: pointer;
+  min-width: 220px;
+  white-space: normal;
+}
+
+.queue-issue-name {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.queue-issue-cell:hover .queue-issue-name {
+  color: var(--primary);
+}
+
+.queue-issue-sub {
+  font-size: 11.5px;
+  color: var(--muted);
+  margin-top: 2px;
+}
+
+.match-tag {
+  font-style: italic;
+}
+
+.dual-measure-primary {
+  font-weight: 700;
+  font-size: 13.5px;
+  color: var(--text);
+}
+
+.dual-measure-unit {
+  color: var(--muted);
+  font-size: 11px;
+  margin-right: 4px;
+}
+
+.dual-measure-sep {
+  color: var(--border);
+  margin: 0 4px;
+}
+
+.dual-measure-secondary {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.queue-trend {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.trend-arrow {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.queue-flags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.flag-glyph {
+  display: inline-block;
+  border: 1px solid var(--muted);
+  color: var(--text);
+  border-radius: 4px;
+  padding: 1px 6px;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
+.queue-row-hidden {
+  display: none !important;
+}
+
+#queue-table .queue-extra-row {
+  display: none;
+}
+
+#queue-table.showing-all .queue-extra-row {
+  display: table-row;
+}
+
+/* Ownership: stacked age-distribution bar. Segment widths come from
+   flex-grow set directly to each bucket's raw count (see the template)
+   — the browser's flex layout does the proportional sizing, so no
+   percentage math is computed in the template itself. */
+.aging-bar-cell {
+  min-width: 120px;
+}
+
+.aging-bar {
+  display: flex;
+  height: 14px;
+  border-radius: 4px;
+  overflow: hidden;
+  background: var(--bg);
+  min-width: 100px;
+}
+
+.aging-seg { height: 100%; }
+.aging-seg-1 { background: var(--aging-1); }
+.aging-seg-2 { background: var(--aging-2); }
+.aging-seg-3 { background: var(--aging-3); }
+.aging-seg-4 { background: var(--aging-4); }
+
+/* Movement */
+.movement-chart-wrap {
+  margin-bottom: 4px;
+}
+
+.movement-chart-wrap svg {
+  width: 100%;
+  height: auto;
+  max-width: 560px;
+}
+
+.movement-chart-labels {
+  display: flex;
+  justify-content: space-between;
+  max-width: 560px;
+  font-size: 11px;
+  color: var(--muted);
+  margin-bottom: 18px;
+}
+
+.movement-columns {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 18px;
+}
+
+/* History tab: interactive daily-volume chart */
+.hist-chart-wrap {
+  position: relative;
+}
+
+.hist-chart {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.hist-axis-label {
+  font-size: 9px;
+  fill: var(--muted);
+}
+
+.hist-bar {
+  fill: #b7c0cf;
+  transition: fill 0.15s;
+}
+
+.hist-bar:hover {
+  fill: #7c8798;
+}
+
+.hist-dot {
+  fill: var(--primary);
+  pointer-events: none;
+}
+
+.hist-tooltip {
+  position: absolute;
+  pointer-events: none;
+  background: var(--text);
+  color: #fff;
+  font-size: 11.5px;
+  font-weight: 600;
+  padding: 5px 10px;
+  border-radius: 6px;
+  white-space: nowrap;
+  z-index: 5;
+  box-shadow: 0 4px 12px rgba(20, 30, 60, 0.25);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .hist-bar { transition: none; }
+}
+
+@media (max-width: 900px) {
+  .movement-columns { grid-template-columns: 1fr; }
+}
+
+.movement-col h4 {
+  margin: 0 0 8px;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.movement-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-size: 12px;
+  color: var(--text);
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.movement-list li {
+  padding: 7px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.movement-list li:last-child {
+  border-bottom: none;
+}
+
+.movement-item-title {
+  color: var(--text);
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.movement-item-title .priority-label {
+  font-size: 10px;
+}
+
+.movement-item-sub {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 2px;
+  font-variant-numeric: tabular-nums;
 }
 
 /* Email Draft tab */

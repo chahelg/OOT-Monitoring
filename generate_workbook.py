@@ -38,6 +38,33 @@ import openpyxl
 APP_DIR = Path(__file__).parent
 OUTPUT_DIR = APP_DIR / "output"
 
+# Interface matrix reference — a catalog of SAP interfaces (which
+# Datadog application each one reports under, its owning stream,
+# middleware, etc). Kept out of git (see .gitignore) since it carries
+# real employee names/emails; the app degrades gracefully if it isn't
+# present (see load_interface_index).
+INTERFACE_MATRIX_PATH = APP_DIR / "reference" / "Oxygen_Interface_Matrix_w1.xlsx"
+INTERFACE_MATRIX_SHEET = "Interface Matrix R1+R2"
+
+# Who to contact per integration stream — given directly, not sourced
+# from the interface matrix (whose own contact columns are far noisier
+# free-text email chains). Streams not listed here (e.g. "MDG", which
+# the matrix has 15 interfaces for) simply have no contact on file —
+# see _contacts_for_streams.
+STREAM_CONTACTS = {
+    "OTC": ["Rathinasamy Gobinath", "Preetiballav Nayak"],
+    "FTM": ["Rohidas Shinde"],
+    "SCM": ["Rohit Khatkale", "Rupesh Lokhande (p2)", "Manoj Kumar Jena (TM)"],
+    "SMM": ["Milind Mokel (PP)", "Pooja Bhagat (PM)"],
+}
+
+# Additive, not a replacement for the stream contact above: a
+# Technical-grouped error (the same Technical/Functional split already
+# shown as "alert grouping" elsewhere) can belong to any stream, so
+# this is appended alongside whichever stream contact(s) resolve for
+# that category — see _resolve_category_contacts.
+TECHNICAL_CONTACT = "Harshit Joshi"
+
 EXPECTED_HEADERS = [
     "TIMESTAMP",
     "SERVICE",
@@ -359,7 +386,12 @@ def compute_pivot(rows: list[dict]) -> dict:
     }
 
 
-def compute_aging(rows: list[dict], now: datetime | None = None, threshold_hours: int = 48) -> list[dict]:
+def compute_aging(
+    rows: list[dict],
+    now: datetime | None = None,
+    threshold_hours: int = 48,
+    latest_overall_date=None,
+) -> list[dict]:
     """Groups rows by Alert type (the same categorization the daily
     observations email uses) and flags categories whose earliest
     occurrence is older than `threshold_hours` — i.e. still open (still
@@ -371,19 +403,32 @@ def compute_aging(rows: list[dict], now: datetime | None = None, threshold_hours
     recent day in the dataset — these two flags are mutually exclusive
     by construction (a category already old enough to be `flagged` is
     reported there, not as a spike, even if its volume is recent).
+
+    `latest_overall_date` is "the most recent day in the dataset" that
+    both `is_new_spike` and `is_recurring` are judged against. Normally
+    left as None and derived from `rows` itself — correct when `rows`
+    is the whole file. But build_stream_channels calls this once per
+    channel on a row *subset*, and a channel that simply has no alerts
+    on the file's actual latest day would otherwise derive its own,
+    earlier "latest day" and misjudge activity from a day or two back
+    as a fresh spike — consistent within that one channel, but
+    contradicting the same category's flag everywhere else on the page.
+    Passing the real file-wide latest date in keeps every channel
+    judging "recent" against the same day, the same way `now` already
+    has to be passed in for age to mean the same instant everywhere.
     """
     if now is None:
         now = datetime.now()
 
     groups: dict[str, dict] = {}
-    latest_overall_date = None
+    derive_latest_date = latest_overall_date is None
     for rec in rows:
         key = rec["alert_type"] or ""
         if not key:
             continue
         ts = rec["timestamp_readable"]
         day = ts.date()
-        if latest_overall_date is None or day > latest_overall_date:
+        if derive_latest_date and (latest_overall_date is None or day > latest_overall_date):
             latest_overall_date = day
         g = groups.setdefault(key, {
             "alert_type": key,
@@ -459,6 +504,385 @@ def compute_aging_stats(aging: list[dict], top_n: int = 10) -> dict:
         "max_count": max((r["count"] for r in aging), default=1),
         "top": top,
     }
+
+
+_INTERFACE_MATRIX_COLUMNS = {
+    "Stream": "stream",
+    "Interface Name": "interface_name",
+    "Middleware (Primary)": "middleware",
+    "S4H Integration technology": "s4_integration_tech",
+    "Interface Mode": "interface_mode",
+    "Message Direction": "message_direction",
+    "Datadog ApplicationName": "datadog_app_name",
+    "API Technical details( SOAP / ODATA)": "api_technical_details",
+    "AIF Interface Description": "aif_description",
+}
+
+
+def load_interface_matrix(path: Path = INTERFACE_MATRIX_PATH, sheet: str = INTERFACE_MATRIX_SHEET) -> list[dict]:
+    """Reads the interface matrix's header row by name, not position —
+    same defensive reasoning as _rows_to_records, since this is a
+    reference file someone else maintains and could reorder columns in.
+    Raises a clear error listing what's missing rather than silently
+    misreading columns."""
+    wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+    try:
+        ws = wb[sheet]
+        rows_iter = ws.iter_rows(values_only=True)
+        header_row = next(rows_iter)
+        header_map = {}
+        for i, cell in enumerate(header_row):
+            if cell is not None:
+                header_map[str(cell).strip()] = i
+
+        missing = [h for h in _INTERFACE_MATRIX_COLUMNS if h not in header_map]
+        if missing:
+            raise ValueError(
+                f"Interface matrix is missing expected column(s) {missing}. "
+                f"Found: {list(header_map.keys())}"
+            )
+
+        records = []
+        for raw_row in rows_iter:
+            if raw_row is None or all(v is None for v in raw_row):
+                continue
+            rec = {}
+            for header, key in _INTERFACE_MATRIX_COLUMNS.items():
+                idx = header_map[header]
+                value = raw_row[idx] if idx < len(raw_row) else None
+                if key == "api_technical_details":
+                    text = "" if value is None else str(value)
+                    rec[key] = [t.strip() for t in text.split("\n") if t.strip()]
+                else:
+                    rec[key] = "" if value is None else str(value).strip()
+            records.append(rec)
+        return records
+    finally:
+        wb.close()
+
+
+def build_interface_index(matrix_rows: list[dict]) -> dict[str, list[dict]]:
+    """Groups interface-matrix rows by Datadog application name — the
+    join key against alert data's APPLICATION_NAME. Rows with no
+    Datadog name set (not Datadog-monitored) are skipped."""
+    index: dict[str, list[dict]] = defaultdict(list)
+    for row in matrix_rows:
+        if row["datadog_app_name"]:
+            index[row["datadog_app_name"]].append(row)
+    return dict(index)
+
+
+def load_interface_index(path: Path = INTERFACE_MATRIX_PATH) -> dict | None:
+    """The only entry point webapp.py calls. Returns None — never
+    raises — if the reference file isn't present yet or fails to
+    parse, so the Aging tab keeps working (just without this
+    enrichment) before anyone's placed the file."""
+    if not path.exists():
+        return None
+    try:
+        return build_interface_index(load_interface_matrix(path))
+    except Exception:
+        return None
+
+
+_ALERT_MSG_PREFIX_RE = re.compile(r'^([A-Z0-9_\-]+)\s+with object key', re.IGNORECASE)
+_NON_ALNUM_RE = re.compile(r'[^A-Z0-9]')
+
+
+def _normalize_api_token(text: str) -> str:
+    """'API_OUTBOUND_DELIVERY_SRV' -> 'OUTBOUNDDELIVERY' — strips the
+    API_/_SRV affixes and all punctuation so it can be substring-
+    matched against an alert's own job-name text regardless of
+    hyphen/underscore differences."""
+    t = text.strip().upper()
+    t = re.sub(r'^API_', '', t)
+    t = re.sub(r'_SRV\w*$', '', t)
+    return _NON_ALNUM_RE.sub('', t)
+
+
+def _disambiguation_text(rec: dict) -> str:
+    """The text used to pick one interface out of several candidates
+    sharing one application. ALERT_MESSAGE has a reliable job-name
+    prefix before "with object key" (e.g.
+    "OUTBOUND_DELIVERY-POST-GOODS-ISSUE with object key ...") that
+    maps directly to the correct interface's own API Technical details
+    value — confirmed against real data. Falls back to ERROR_MESSAGE +
+    TRANSACTION_URL as free-form search text when that prefix isn't
+    present."""
+    m = _ALERT_MSG_PREFIX_RE.match(str(rec.get("ALERT_MESSAGE") or "").strip())
+    if m:
+        return m.group(1)
+    return " ".join(str(rec.get(k) or "") for k in ("ERROR_MESSAGE", "TRANSACTION_URL"))
+
+
+def resolve_interface_candidates(candidates: list[dict], alert_text: str) -> dict:
+    """Picks ONE interface-matrix row out of `candidates` (all rows
+    sharing one Datadog application) using `alert_text`. Returns
+    {"resolved": <row>} or {"resolved": None} if it can't confidently
+    narrow to a single row — callers should treat every candidate as
+    equally likely in that case, not guess."""
+    if len(candidates) == 1:
+        return {"resolved": candidates[0]}
+
+    haystack = _NON_ALNUM_RE.sub('', alert_text.upper())
+
+    # Tier 1: narrow by API Technical details token substring match.
+    tier1 = [
+        row for row in candidates
+        if any(
+            tok and haystack and (tok in haystack or haystack in tok)
+            for tok in (_normalize_api_token(a) for a in row["api_technical_details"])
+        )
+    ]
+    pool = tier1 or candidates
+    if len(pool) == 1:
+        return {"resolved": pool[0]}
+
+    # Tier 2 tie-break: score by alert-text token overlap against
+    # Interface Name + AIF Interface Description; only accept a clear,
+    # unambiguous winner rather than guessing on a tie.
+    alert_tokens = [t for t in re.split(r'[-_ ]+', alert_text.upper()) if len(t) >= 3]
+    if not alert_tokens:
+        return {"resolved": None}
+    scored = sorted(
+        (
+            (sum(1 for t in alert_tokens if t in f"{row['interface_name']} {row['aif_description']}".upper()), row)
+            for row in pool
+        ),
+        key=lambda item: -item[0],
+    )
+    if scored and scored[0][0] > 0 and (len(scored) == 1 or scored[0][0] > scored[1][0]):
+        return {"resolved": scored[0][1]}
+    return {"resolved": None}
+
+
+def _contacts_for_streams(streams: list[str]) -> list[str]:
+    """Splits combined values like "SCM-FTM"/"OTC+SCM" and looks each
+    part up in STREAM_CONTACTS, deduping while preserving order.
+    Streams with nobody on file (e.g. "MDG") simply contribute
+    nothing — that's the expected, non-error case."""
+    seen: list[str] = []
+    for s in streams:
+        for part in re.split(r'[-+]', s):
+            for name in STREAM_CONTACTS.get(part.strip(), []):
+                if name not in seen:
+                    seen.append(name)
+    return seen
+
+
+def _resolve_category_contacts(streams: list[str], grouping: str) -> list[str]:
+    """Stream contact(s) plus, for a Technical-grouped category, the
+    technical contact — additive, not a replacement, since which stream
+    an error's application belongs to is independent of whether that
+    error is Technical or Functional. Computed regardless of whether
+    the interface matrix resolved a stream at all (`streams` may be
+    empty), so a Technical-grouped category still gets a contact even
+    when its application isn't in the matrix."""
+    contacts = _contacts_for_streams(streams)
+    if grouping == "Technical" and TECHNICAL_CONTACT not in contacts:
+        contacts.append(TECHNICAL_CONTACT)
+    return contacts
+
+
+def _resolve_category_interface(cat_rows: list[dict], matrix_index: dict | None) -> dict:
+    """The per-category resolution behind enrich_aging_with_interfaces.
+    Tallies votes over (stream, interface_name, direction) across every
+    alert row in the category — using the disambiguated interface where
+    possible, or every candidate as an equal vote where it can't be
+    narrowed — and returns the majority pick, the same "pick the
+    dominant value" idea compute_aging's own `grouping` field already
+    uses for Technical/Functional."""
+    if matrix_index is None:
+        return {"status": "unavailable"}
+
+    key_counts: dict[tuple, int] = defaultdict(int)
+    key_to_row: dict[tuple, dict] = {}
+    unmapped_apps: set[str] = set()
+    considered = 0
+
+    for r in cat_rows:
+        app_name = r.get("APPLICATION_NAME")
+        if not app_name:
+            continue
+        candidates = matrix_index.get(app_name, [])
+        if not candidates:
+            unmapped_apps.add(app_name)
+            continue
+        considered += 1
+        result = resolve_interface_candidates(candidates, _disambiguation_text(r))
+        pool = [result["resolved"]] if result["resolved"] else candidates
+        for row in pool:
+            key = (row["stream"], row["interface_name"], row["message_direction"])
+            key_counts[key] += 1
+            key_to_row[key] = row
+
+    if considered == 0:
+        return {"status": "no_mapping", "unmapped_apps": sorted(unmapped_apps)}
+
+    best_key = max(key_counts.items(), key=lambda kv: kv[1])[0]
+    distinct_keys = list(key_counts.keys())
+    streams = sorted({k[0] for k in distinct_keys})
+    return {
+        "status": "resolved",
+        "spans_multiple": len(distinct_keys) > 1,
+        "distinct_count": len(distinct_keys),
+        "row": key_to_row[best_key],
+        "streams": streams,
+        "unmapped_apps": sorted(unmapped_apps),
+    }
+
+
+def enrich_aging_with_interfaces(aging: list[dict], rows: list[dict], matrix_index: dict | None) -> list[dict]:
+    """Attaches interface-matrix data (Stream/Interface/Middleware/S4
+    tech/Mode/Direction/Contact) plus a sample error text to each
+    compute_aging() category — the data source for the Aging tab's
+    "who do I contact about this" columns. Returns new dicts; doesn't
+    mutate `aging` (compute_aging's own output still feeds the Email
+    Draft tab, which has no use for any of this, so this stays a
+    separate, optional enrichment step rather than folded into
+    compute_aging itself)."""
+    rows_by_type: dict[str, list[dict]] = defaultdict(list)
+    for r in rows:
+        if r["alert_type"]:
+            rows_by_type[r["alert_type"]].append(r)
+
+    enriched = []
+    for cat in aging:
+        cat_rows = rows_by_type.get(cat["alert_type"], [])
+        latest_row = max(cat_rows, key=lambda r: r["timestamp_readable"]) if cat_rows else None
+        sample_error_text = (
+            classify_text(latest_row["ERROR_MESSAGE"], latest_row["ERROR_DETAILS"]) if latest_row else ""
+        )
+        try:
+            interface_info = _resolve_category_interface(cat_rows, matrix_index)
+        except Exception:
+            interface_info = {"status": "unavailable"}
+        interface_info["app_names"] = sorted({r["APPLICATION_NAME"] for r in cat_rows if r["APPLICATION_NAME"]})
+        # Contact resolution is independent of whether the interface
+        # matrix resolved a stream at all — a Technical-grouped category
+        # still gets the technical contact even with status "no_mapping"
+        # or "unavailable", so this always runs, not just on "resolved".
+        interface_info["contacts"] = _resolve_category_contacts(
+            interface_info.get("streams", []), cat["grouping"]
+        )
+        enriched.append({**cat, "interface": interface_info, "sample_error_text": sample_error_text})
+    return enriched
+
+
+def resolve_row_stream(row: dict, matrix_index: dict | None) -> dict:
+    """Resolves ONE alert row to its stream(s) — the per-row counterpart
+    to _resolve_category_interface's app+disambiguation logic. Needed
+    for the channel dashboard (build_stream_channels), which groups
+    individual alerts by stream rather than picking one majority stream
+    for a whole category. Usually resolves to exactly one stream even
+    when the specific *interface* can't be disambiguated, since an
+    application's several interfaces are usually (not always) all under
+    the same stream — confirmed on real data (e.g. ASTRO-WMS-BENE has 9
+    candidate interfaces but only one distinct stream, SCM)."""
+    if matrix_index is None:
+        return {"status": "unavailable", "streams": []}
+    app_name = row.get("APPLICATION_NAME")
+    if not app_name:
+        return {"status": "no_mapping", "streams": [], "unmapped_app": None}
+    candidates = matrix_index.get(app_name, [])
+    if not candidates:
+        return {"status": "no_mapping", "streams": [], "unmapped_app": app_name}
+    result = resolve_interface_candidates(candidates, _disambiguation_text(row))
+    if result["resolved"]:
+        return {"status": "resolved", "streams": [result["resolved"]["stream"]]}
+    # Couldn't narrow to one interface, but the stream itself may still
+    # be unambiguous even when the specific interface isn't.
+    distinct_streams = sorted({c["stream"] for c in candidates})
+    return {"status": "resolved", "streams": distinct_streams}
+
+
+STREAM_UNMAPPED = "Unmapped"
+
+
+def build_stream_channels(
+    rows: list[dict],
+    matrix_index: dict | None,
+    now: datetime | None = None,
+    threshold_hours: int = 48,
+) -> list[dict]:
+    """Groups alerts into per-stream channels (SCM/OTC/FTM/SMM/MDG/...) —
+    the data behind the Aging tab's channel dashboard. A row whose
+    application spans multiple streams (rare — see resolve_row_stream)
+    counts toward each of those channels; a row with no interface
+    mapping (e.g. MULESOFT) goes into one "Unmapped" pseudo-channel
+    instead of being silently dropped.
+
+    Reuses compute_aging() itself, just scoped to each channel's row
+    subset, so a channel's per-category numbers (count, flagged,
+    day_counts, ...) stay byte-for-byte consistent with the flat Aging
+    table — this is a grouping/presentation layer on top of the same
+    facts, not a second source of truth. `now` is computed once and
+    threaded through every channel's compute_aging() call so "today"
+    means the same instant everywhere on the page, not a slightly
+    different one per channel.
+
+    Every row counts toward exactly one channel, never more — even the
+    rare row whose exact interface can't be pinned down still only
+    contributes to one (its first candidate stream, alphabetically, for
+    a deterministic pick). An earlier version fanned such a row out to
+    every candidate stream, which sounded more honest about the
+    ambiguity but actually broke trust in the numbers: channel totals
+    stopped summing to the file's real row count or to the stat tiles
+    above them, which reads as the dashboard being wrong/stale even
+    though every number was freshly computed. Consistent-but-slightly-
+    approximate beats accurate-but-unreconcilable here.
+    """
+    if now is None:
+        now = datetime.now()
+    latest_overall_date = max(
+        (r["timestamp_readable"].date() for r in rows if r["alert_type"]), default=None
+    )
+
+    rows_by_stream: dict[str, list[dict]] = defaultdict(list)
+    for r in rows:
+        if not r["alert_type"]:
+            continue
+        info = resolve_row_stream(r, matrix_index)
+        stream = info["streams"][0] if info["streams"] else STREAM_UNMAPPED
+        rows_by_stream[stream].append(r)
+
+    channels = []
+    for stream, stream_rows in rows_by_stream.items():
+        categories = compute_aging(
+            stream_rows, now=now, threshold_hours=threshold_hours,
+            latest_overall_date=latest_overall_date,
+        )
+        for cat in categories:
+            # Additive technical contact, same rule as
+            # _resolve_category_contacts — surfaced per-category since a
+            # channel is normally a mix of Technical and Functional
+            # categories, not one or the other.
+            cat["technical_contact"] = TECHNICAL_CONTACT if cat["grouping"] == "Technical" else None
+        if stream == STREAM_UNMAPPED:
+            # Labeled by whichever application(s) actually didn't match
+            # the interface matrix (in practice, just "MULESOFT" — a
+            # middleware name, never a Datadog application in the
+            # matrix) rather than a generic "Unmapped", since that's
+            # more useful at a glance. Falls back to the generic label
+            # only if even the application name is missing.
+            unmapped_apps = sorted({r["APPLICATION_NAME"] for r in stream_rows if r.get("APPLICATION_NAME")})
+            display_stream = ", ".join(unmapped_apps) if unmapped_apps else STREAM_UNMAPPED
+            contacts = []
+        else:
+            display_stream = stream
+            contacts = _contacts_for_streams([stream])
+        channels.append({
+            "stream": display_stream,
+            "contacts": contacts,
+            "categories": categories,
+            "total_alerts": sum(c["count"] for c in categories),
+            "flagged_total": sum(c["count"] for c in categories if c["flagged"]),
+            "n_flagged_categories": sum(1 for c in categories if c["flagged"]),
+            "n_spikes": sum(1 for c in categories if c["is_new_spike"]),
+        })
+
+    channels.sort(key=lambda c: (-c["flagged_total"], -c["total_alerts"]))
+    return channels
 
 
 def build_email_draft(rows: list[dict], aging: list[dict], threshold_hours: int = 48, max_items: int = 6) -> str:
@@ -981,15 +1405,18 @@ def patch_workbook_xml(xml_text: str) -> str:
     return xml_text
 
 
-def patch_workbook_rels(xml_text: str, detail_rid: str, calc_rid: str | None) -> str:
+def patch_workbook_rels(xml_text: str, detail_rid: str | None, calc_rid: str | None) -> str:
     # detail_rid/calc_rid are resolved per-template (see generate_workbook)
     # rather than assumed to always be "rId1"/"rId10" — which sheet/part
     # physically lands at a given rId isn't stable across templates.
-    xml_text = re.sub(
-        rf'<Relationship Id="{detail_rid}" Type="[^"]*worksheet" Target="[^"]*"/>',
-        "",
-        xml_text,
-    )
+    # detail_rid is None on a template that never had a Detail1 staging
+    # sheet to begin with — nothing to remove, not an error.
+    if detail_rid:
+        xml_text = re.sub(
+            rf'<Relationship Id="{detail_rid}" Type="[^"]*worksheet" Target="[^"]*"/>',
+            "",
+            xml_text,
+        )
     if calc_rid:
         xml_text = re.sub(
             rf'<Relationship Id="{calc_rid}" Type="[^"]*calcChain" Target="calcChain\.xml"/>',
@@ -999,8 +1426,10 @@ def patch_workbook_rels(xml_text: str, detail_rid: str, calc_rid: str | None) ->
     return xml_text
 
 
-def patch_content_types(xml_text: str, detail_sheet_part: str, detail_table_part: str | None) -> str:
-    parts = ["/" + detail_sheet_part, "/xl/calcChain.xml"]
+def patch_content_types(xml_text: str, detail_sheet_part: str | None, detail_table_part: str | None) -> str:
+    parts = ["/xl/calcChain.xml"]
+    if detail_sheet_part:
+        parts.append("/" + detail_sheet_part)
     if detail_table_part:
         parts.append("/" + detail_table_part)
     for part in parts:
@@ -1011,6 +1440,12 @@ def patch_content_types(xml_text: str, detail_sheet_part: str, detail_table_part
 
 
 def patch_app_xml(xml_text: str) -> str:
+    # No-op on a template that never had a Detail1 sheet listed in its
+    # title vector — nothing to remove, and blindly decrementing the
+    # count regardless (the old behavior) would corrupt this metadata
+    # on such a template rather than just leaving it alone.
+    if "<vt:lpstr>Detail1</vt:lpstr>" not in xml_text:
+        return xml_text
     xml_text = xml_text.replace(
         "<vt:variant><vt:i4>4</vt:i4></vt:variant>",
         "<vt:variant><vt:i4>3</vt:i4></vt:variant>",
@@ -1294,20 +1729,38 @@ def generate_workbook(technical_path: Path, functional_path: Path, template_path
             # wrong sheet's relationship, on a template with different
             # internal numbering.
             data_part = _resolve_sheet_part(workbook_xml, rels_xml, "Data")
-            detail_rid = _sheet_rid(workbook_xml, "Detail1")
-            detail_sheet_part = _rid_target(rels_xml, detail_rid)
-            detail_dir, detail_file = detail_sheet_part.rsplit("/", 1)
-            detail_sheet_rels_part = f"{detail_dir}/_rels/{detail_file}.rels"
-            detail_table_part = _resolve_table_part(zin, detail_sheet_part)
-            detail_custom_property_part = _resolve_related_part(zin, detail_sheet_part, "customProperty")
+
+            # Detail1 is a disposable staging sheet some templates carry
+            # and some don't — older/raw master templates had it, but
+            # the daily templates stopped including it at some point.
+            # Older code required it and raised if missing; that's wrong
+            # now that "no Detail1" is the normal case, not corruption.
+            # When present, still resolved by name rather than assumed
+            # to live at any particular sheetN.xml/rId, for the same
+            # reason "Data" is resolved by name just above.
+            try:
+                detail_rid = _sheet_rid(workbook_xml, "Detail1")
+            except ValueError:
+                detail_rid = None
+            if detail_rid:
+                detail_sheet_part = _rid_target(rels_xml, detail_rid)
+                detail_dir, detail_file = detail_sheet_part.rsplit("/", 1)
+                detail_sheet_rels_part = f"{detail_dir}/_rels/{detail_file}.rels"
+                detail_table_part = _resolve_table_part(zin, detail_sheet_part)
+                detail_custom_property_part = _resolve_related_part(zin, detail_sheet_part, "customProperty")
+            else:
+                detail_sheet_part = None
+                detail_sheet_rels_part = None
+                detail_table_part = None
+                detail_custom_property_part = None
+
             calc_rid_m = re.search(r'<Relationship Id="(rId\d+)"[^>]*Target="calcChain\.xml"', rels_xml)
             calc_rid = calc_rid_m.group(1) if calc_rid_m else None
 
-            skip = {detail_sheet_part, detail_sheet_rels_part, "xl/calcChain.xml"}
-            if detail_table_part:
-                skip.add(detail_table_part)
-            if detail_custom_property_part:
-                skip.add(detail_custom_property_part)
+            skip = {"xl/calcChain.xml"}
+            for part in (detail_sheet_part, detail_sheet_rels_part, detail_table_part, detail_custom_property_part):
+                if part:
+                    skip.add(part)
 
             with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zout:
                 for name in names:

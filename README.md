@@ -30,7 +30,9 @@ a proprietary format or a hosted service.
 - **Aging**: a dashboard (stat tiles, a ranked bar chart, a legend) of
   which alert categories are still open past a 48-hour window, based on
   how long each has been appearing in the data, plus the full detail
-  table below it.
+  table below it — including, if the interface matrix reference file is
+  present (see "Optional: interface matrix"), which Stream/interface
+  owns each category and who to contact about it.
 - **Email Draft**: auto-writes a draft of the daily observations email
   from the aging data, using one disclosed rule for "recurring vs. new
   spike" framing — always a draft to review, never auto-sent. A second,
@@ -88,6 +90,22 @@ it to take anywhere from under a minute to several minutes, since it
 makes several small, isolated model calls per email rather than one —
 see `build_email_draft_ai`'s docstring in `generate_workbook.py` for
 why.
+
+## Optional: interface matrix
+
+The Aging tab's Stream/Interface/Middleware/Contact columns need a copy
+of the interface matrix reference workbook at
+`reference/Oxygen_Interface_Matrix_w1.xlsx` (sheet "Interface Matrix
+R1+R2"), joined against each alert's `APPLICATION_NAME` via the
+matrix's own "Datadog ApplicationName" column. Without that file, the
+Aging tab still works exactly as before, just without those columns
+filled in.
+
+This file isn't included and is gitignored on purpose — it contains
+real employee names and email addresses, not code. Copy your own into
+`reference/` (create the folder if it doesn't exist) to enable it, and
+replace it there whenever the matrix itself is updated — the app reads
+it fresh on every request, nothing is cached.
 
 ## Files
 
